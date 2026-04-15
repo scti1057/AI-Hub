@@ -1,0 +1,9 @@
+requests
+python-dotenv
+pydantic
+rich
+fastapi[standard]
+itsdangerous
+
+pywebpush
+cryptography

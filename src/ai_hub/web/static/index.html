@@ -1,0 +1,926 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>AI Hub</title>
+
+  <link rel="manifest" href="/static/manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+
+  <meta name="theme-color" content="#16213e" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="AI Hub" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+  <style>
+    :root {
+      --bg: linear-gradient(180deg, #edf1f7 0%, #dfe7f0 100%);
+      --panel: rgba(255, 255, 255, 0.92);
+      --ink: #132238;
+      --muted: #5a6a7f;
+      --line: rgba(19, 34, 56, 0.12);
+      --accent: #157f75;
+      --accent-strong: #0c5f58;
+      --warn: #c66a10;
+      --danger: #b54343;
+      --shadow: 0 18px 40px rgba(18, 37, 58, 0.12);
+      --radius: 18px;
+      --mono: "SFMono-Regular", "Menlo", monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      overflow-x: hidden;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      background: var(--bg);
+      overflow-x: hidden;
+    }
+
+    .shell {
+      width: min(100%, 1380px);
+      margin: 0 auto;
+      padding:
+        max(14px, env(safe-area-inset-top))
+        max(12px, env(safe-area-inset-right))
+        max(18px, calc(18px + env(safe-area-inset-bottom)))
+        max(12px, env(safe-area-inset-left));
+    }
+
+    .topbar {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 14px;
+      margin-bottom: 16px;
+    }
+
+    .title-block h1 {
+      margin: 0;
+      font-size: clamp(1.55rem, 5vw, 2rem);
+      letter-spacing: 0.02em;
+    }
+
+    .title-block p {
+      margin: 6px 0 0;
+      color: var(--muted);
+    }
+
+    .button-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: none;
+      border-radius: 12px;
+      padding: 11px 14px;
+      font-size: 0.95rem;
+      cursor: pointer;
+      background: var(--accent);
+      color: white;
+      box-shadow: 0 10px 20px rgba(21, 127, 117, 0.18);
+      max-width: 100%;
+    }
+
+    button.secondary {
+      background: #eef3f7;
+      color: var(--ink);
+      box-shadow: none;
+    }
+
+    button.warn {
+      background: var(--warn);
+    }
+
+    button.danger {
+      background: var(--danger);
+    }
+
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      box-shadow: none;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 14px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(12px);
+      min-width: 0;
+    }
+
+    .panel h2,
+    .panel h3 {
+      margin-top: 0;
+    }
+
+    .thread-list,
+    .approval-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .thread-item,
+    .approval-item {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+      background: rgba(255, 255, 255, 0.82);
+      min-width: 0;
+    }
+
+    .thread-item.active {
+      border-color: rgba(21, 127, 117, 0.4);
+      background: rgba(21, 127, 117, 0.08);
+    }
+
+    .thread-title {
+      font-weight: 700;
+      margin-bottom: 6px;
+      overflow-wrap: anywhere;
+    }
+
+    .thread-meta,
+    .approval-meta,
+    .mini {
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .stat {
+      border-radius: 14px;
+      background: rgba(19, 34, 56, 0.05);
+      padding: 12px;
+    }
+
+    .stat strong {
+      display: block;
+      font-size: 1.25rem;
+      margin-top: 4px;
+    }
+
+    .chat-header {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    #chat-log {
+      min-height: 280px;
+      max-height: 52vh;
+      overflow-y: auto;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      padding: 12px;
+      background: rgba(248, 250, 252, 0.95);
+      margin-bottom: 14px;
+      min-width: 0;
+    }
+
+    .message {
+      margin-bottom: 12px;
+      padding: 12px;
+      border-radius: 14px;
+      white-space: pre-wrap;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+
+    .message.user {
+      background: rgba(21, 127, 117, 0.08);
+      border: 1px solid rgba(21, 127, 117, 0.14);
+    }
+
+    .message.assistant {
+      background: white;
+      border: 1px solid rgba(19, 34, 56, 0.08);
+    }
+
+    .message-header {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-bottom: 6px;
+      font-size: 0.86rem;
+      color: var(--muted);
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 112px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      padding: 13px;
+      font: inherit;
+      resize: vertical;
+      background: rgba(255, 255, 255, 0.96);
+      margin-bottom: 12px;
+      max-width: 100%;
+    }
+
+    .status-line {
+      margin-top: 12px;
+      color: var(--muted);
+      min-height: 24px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: rgba(19, 34, 56, 0.05);
+    }
+
+    code {
+      font-family: var(--mono);
+      font-size: 0.92em;
+    }
+
+    .approval-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+      flex-wrap: wrap;
+    }
+
+    .panel-main {
+      order: 1;
+    }
+
+    .panel-approvals {
+      order: 2;
+    }
+
+    .panel-threads {
+      order: 3;
+    }
+
+    .panel-subtitle {
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .standalone-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(21, 127, 117, 0.1);
+      color: var(--accent-strong);
+      font-size: 0.82rem;
+      font-weight: 700;
+      width: fit-content;
+    }
+
+    body.is-standalone .shell {
+      padding-top: max(10px, env(safe-area-inset-top));
+    }
+
+    body.is-standalone .topbar {
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    body.is-standalone #chat-log {
+      max-height: 46vh;
+    }
+
+    @media (min-width: 720px) {
+      .topbar {
+        flex-direction: row;
+        justify-content: space-between;
+        align-items: center;
+        gap: 16px;
+        margin-bottom: 18px;
+      }
+
+      .panel {
+        padding: 16px;
+      }
+
+      .status-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .chat-header {
+        flex-direction: row;
+        justify-content: space-between;
+        align-items: flex-start;
+      }
+
+      .message-header {
+        flex-direction: row;
+        justify-content: space-between;
+        gap: 12px;
+      }
+    }
+
+    @media (min-width: 980px) {
+      .layout {
+        grid-template-columns: 260px minmax(0, 1fr);
+        gap: 16px;
+      }
+
+      .panel-threads {
+        order: 1;
+      }
+
+      .panel-main {
+        order: 2;
+      }
+
+      .panel-approvals {
+        order: 3;
+        grid-column: 1 / -1;
+      }
+    }
+
+    @media (min-width: 1220px) {
+      .layout {
+        grid-template-columns: 280px minmax(0, 1fr) 320px;
+        gap: 18px;
+      }
+
+      .panel-threads,
+      .panel-main,
+      .panel-approvals {
+        order: initial;
+        grid-column: auto;
+      }
+
+      .panel {
+        padding: 18px;
+      }
+
+      #chat-log {
+        max-height: 58vh;
+      }
+    }
+
+    @media (max-width: 520px) {
+      .button-row {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        width: 100%;
+      }
+
+      .button-row button {
+        width: 100%;
+      }
+
+      .status-grid {
+        grid-template-columns: 1fr;
+      }
+
+      #chat-log {
+        max-height: none;
+        min-height: 220px;
+      }
+
+      textarea {
+        min-height: 98px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="topbar">
+      <div class="title-block">
+        <h1>AI Hub</h1>
+        <p>Thread-basierte Manager-Konsole mit Approval-Workflow</p>
+        <div class="standalone-badge" id="display-mode-badge">Browser-Modus</div>
+      </div>
+
+      <div class="button-row">
+        <button id="new-thread-btn" class="secondary">Neuer Chat</button>
+        <button id="enable-push-btn" class="secondary">Push aktivieren</button>
+        <button id="disable-push-btn" class="secondary">Push deaktivieren</button>
+        <button id="logout-btn" class="secondary">Logout</button>
+      </div>
+    </div>
+
+    <div class="layout">
+      <aside class="panel panel-threads">
+        <h2>Chats</h2>
+        <div class="panel-subtitle">Persistente Threads, kompakt auswählbar und auch mobil gut bedienbar.</div>
+        <div class="thread-list" id="thread-list"></div>
+      </aside>
+
+      <main class="panel panel-main">
+        <div class="status-grid" id="status-grid">
+          <div class="stat">
+            Threads
+            <strong id="threads-total">0</strong>
+          </div>
+          <div class="stat">
+            Push
+            <strong id="push-total">0</strong>
+          </div>
+          <div class="stat">
+            Freigaben
+            <strong id="approvals-total">0</strong>
+          </div>
+        </div>
+
+        <div class="chat-header">
+          <div>
+            <h2 id="thread-title">Noch kein Chat ausgewählt</h2>
+            <div class="mini" id="thread-meta">Der Manager arbeitet thread-basiert und behält Verlauf und Freigaben pro Chat.</div>
+          </div>
+          <div class="button-row">
+            <button id="archive-thread-btn" class="warn" disabled>Archivieren</button>
+            <button id="reset-thread-btn" class="danger" disabled>Zurücksetzen</button>
+            <button id="delete-thread-btn" class="danger" disabled>Löschen</button>
+          </div>
+        </div>
+
+        <div id="chat-log"></div>
+
+        <textarea id="message" placeholder="Schreibe hier an den Manager. Für Code-Aufgaben bleibt Ausführung genehmigungspflichtig."></textarea>
+        <div class="button-row">
+          <button id="send-btn">Nachricht senden</button>
+        </div>
+        <div class="status-line" id="status">Bereit.</div>
+      </main>
+
+      <aside class="panel panel-approvals">
+        <h2>Offene Freigaben</h2>
+        <div class="panel-subtitle">Human-in-the-loop bleibt sichtbar: Ausführung erst nach Ja/Nein.</div>
+        <div class="approval-list" id="approval-list"></div>
+      </aside>
+    </div>
+  </div>
+
+  <script>
+    const threadListEl = document.getElementById("thread-list");
+    const approvalListEl = document.getElementById("approval-list");
+    const chatLog = document.getElementById("chat-log");
+    const messageInput = document.getElementById("message");
+    const sendBtn = document.getElementById("send-btn");
+    const logoutBtn = document.getElementById("logout-btn");
+    const statusEl = document.getElementById("status");
+    const enablePushBtn = document.getElementById("enable-push-btn");
+    const disablePushBtn = document.getElementById("disable-push-btn");
+    const newThreadBtn = document.getElementById("new-thread-btn");
+    const archiveThreadBtn = document.getElementById("archive-thread-btn");
+    const resetThreadBtn = document.getElementById("reset-thread-btn");
+    const deleteThreadBtn = document.getElementById("delete-thread-btn");
+    const threadTitleEl = document.getElementById("thread-title");
+    const threadMetaEl = document.getElementById("thread-meta");
+    const threadsTotalEl = document.getElementById("threads-total");
+    const pushTotalEl = document.getElementById("push-total");
+    const approvalsTotalEl = document.getElementById("approvals-total");
+    const displayModeBadge = document.getElementById("display-mode-badge");
+
+    let currentThreadId = null;
+    const query = new URLSearchParams(window.location.search);
+
+    function detectStandaloneMode() {
+      return window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+    }
+
+    function applyDisplayMode() {
+      const standalone = detectStandaloneMode();
+      document.body.classList.toggle("is-standalone", standalone);
+      displayModeBadge.textContent = standalone ? "Home-Screen-App" : "Browser-Modus";
+    }
+
+    function urlBase64ToUint8Array(base64String) {
+      const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+      const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+      const rawData = atob(base64);
+      const outputArray = new Uint8Array(rawData.length);
+
+      for (let i = 0; i < rawData.length; ++i) {
+        outputArray[i] = rawData.charCodeAt(i);
+      }
+
+      return outputArray;
+    }
+
+    async function fetchJson(url, options = {}) {
+      const response = await fetch(url, options);
+
+      if (response.status === 401) {
+        window.location.href = "/login";
+        throw new Error("Nicht eingeloggt.");
+      }
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.message || "Request fehlgeschlagen.");
+      }
+
+      return data;
+    }
+
+    async function registerServiceWorker() {
+      if (!("serviceWorker" in navigator)) {
+        throw new Error("Service Worker werden auf diesem Gerät/Browser nicht unterstützt.");
+      }
+
+      const registration = await navigator.serviceWorker.register("/sw.js");
+      await navigator.serviceWorker.ready;
+      return registration;
+    }
+
+    async function getPushPublicKey() {
+      const data = await fetchJson("/api/push/public-key");
+
+      if (!data.configured || !data.public_key) {
+        throw new Error("Push ist serverseitig noch nicht vollständig konfiguriert.");
+      }
+
+      return data.public_key;
+    }
+
+    async function enablePush() {
+      try {
+        statusEl.textContent = "Push wird eingerichtet...";
+
+        if (!("Notification" in window)) {
+          throw new Error("Benachrichtigungen werden in diesem Browser nicht unterstützt.");
+        }
+
+        const permission = await Notification.requestPermission();
+        if (permission !== "granted") {
+          throw new Error("Benachrichtigungsberechtigung wurde nicht erteilt.");
+        }
+
+        const registration = await registerServiceWorker();
+        const publicKey = await getPushPublicKey();
+        let subscription = await registration.pushManager.getSubscription();
+
+        if (!subscription) {
+          subscription = await registration.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: urlBase64ToUint8Array(publicKey),
+          });
+        }
+
+        await fetchJson("/api/push/subscribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ subscription: subscription.toJSON() }),
+        });
+
+        statusEl.textContent = "Push wurde erfolgreich aktiviert.";
+        await refreshStatus();
+      } catch (error) {
+        console.error(error);
+        statusEl.textContent = `Push-Fehler: ${error.message}`;
+      }
+    }
+
+    async function disablePush() {
+      try {
+        statusEl.textContent = "Push wird deaktiviert...";
+        const registration = await navigator.serviceWorker.getRegistration("/");
+
+        if (!registration) {
+          statusEl.textContent = "Kein Service Worker aktiv.";
+          return;
+        }
+
+        const subscription = await registration.pushManager.getSubscription();
+        if (!subscription) {
+          statusEl.textContent = "Keine aktive Push-Subscription gefunden.";
+          return;
+        }
+
+        await fetchJson("/api/push/unsubscribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ endpoint: subscription.endpoint }),
+        });
+
+        await subscription.unsubscribe();
+        statusEl.textContent = "Push wurde deaktiviert.";
+        await refreshStatus();
+      } catch (error) {
+        console.error(error);
+        statusEl.textContent = `Fehler beim Deaktivieren: ${error.message}`;
+      }
+    }
+
+    function renderThreads(threads) {
+      threadListEl.innerHTML = "";
+
+      if (!threads.length) {
+        threadListEl.innerHTML = "<div class='mini'>Noch keine Chats vorhanden.</div>";
+        return;
+      }
+
+      for (const thread of threads) {
+        const item = document.createElement("div");
+        item.className = `thread-item${thread.id === currentThreadId ? " active" : ""}`;
+
+        const title = document.createElement("div");
+        title.className = "thread-title";
+        title.textContent = thread.title;
+
+        const meta = document.createElement("div");
+        meta.className = "thread-meta";
+        meta.textContent = `${thread.status} · ${new Date(thread.updated_at).toLocaleString()}`;
+
+        const openBtn = document.createElement("button");
+        openBtn.className = "secondary";
+        openBtn.textContent = "Öffnen";
+        openBtn.addEventListener("click", () => loadThread(thread.id));
+
+        item.appendChild(title);
+        item.appendChild(meta);
+        item.appendChild(openBtn);
+        threadListEl.appendChild(item);
+      }
+    }
+
+    function renderMessages(messages) {
+      chatLog.innerHTML = "";
+
+      if (!messages.length) {
+        chatLog.innerHTML = "<div class='mini'>Noch keine Nachrichten in diesem Thread.</div>";
+        return;
+      }
+
+      for (const message of messages) {
+        const item = document.createElement("div");
+        item.className = `message ${message.role}`;
+
+        const header = document.createElement("div");
+        header.className = "message-header";
+        header.textContent = `${message.agent || message.role} · ${new Date(message.created_at).toLocaleString()}`;
+
+        const body = document.createElement("div");
+        body.textContent = message.content;
+
+        item.appendChild(header);
+        item.appendChild(body);
+        chatLog.appendChild(item);
+      }
+
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    function approvalStatusLabel(status) {
+      if (status === "pending") return "Wartet auf Freigabe";
+      if (status === "executed") return "Ausgeführt";
+      if (status === "failed") return "Fehlgeschlagen";
+      if (status === "rejected") return "Abgelehnt";
+      return status;
+    }
+
+    function renderApprovals(approvals) {
+      approvalListEl.innerHTML = "";
+
+      if (!approvals.length) {
+        approvalListEl.innerHTML = "<div class='mini'>Aktuell keine Freigaben offen.</div>";
+        return;
+      }
+
+      for (const approval of approvals) {
+        const item = document.createElement("div");
+        item.className = "approval-item";
+
+        const title = document.createElement("div");
+        title.className = "thread-title";
+        title.textContent = approval.command.preview;
+
+        const meta = document.createElement("div");
+        meta.className = "approval-meta";
+        meta.textContent = `${approval.agent_role} · ${approvalStatusLabel(approval.status)}`;
+
+        const rationale = document.createElement("div");
+        rationale.textContent = approval.rationale;
+
+        item.appendChild(title);
+        item.appendChild(meta);
+        item.appendChild(rationale);
+
+        if (approval.status === "pending") {
+          const actions = document.createElement("div");
+          actions.className = "approval-actions";
+
+          const approveBtn = document.createElement("button");
+          approveBtn.textContent = "Ja, ausführen";
+          approveBtn.addEventListener("click", () => approveRequest(approval.id));
+
+          const rejectBtn = document.createElement("button");
+          rejectBtn.className = "danger";
+          rejectBtn.textContent = "Nein";
+          rejectBtn.addEventListener("click", () => rejectRequest(approval.id));
+
+          actions.appendChild(approveBtn);
+          actions.appendChild(rejectBtn);
+          item.appendChild(actions);
+        } else if (approval.result) {
+          const result = document.createElement("div");
+          result.className = "mini";
+          result.textContent = `Returncode: ${approval.result.returncode}`;
+          item.appendChild(result);
+        }
+
+        approvalListEl.appendChild(item);
+      }
+    }
+
+    async function refreshStatus() {
+      const data = await fetchJson("/api/status");
+      threadsTotalEl.textContent = data.status.threads_total;
+      pushTotalEl.textContent = data.status.push_subscriptions;
+      approvalsTotalEl.textContent = data.status.pending_approvals;
+    }
+
+    async function refreshThreads(preferredThreadId = null) {
+      const data = await fetchJson("/api/threads");
+      renderThreads(data.threads);
+
+      const nextThreadId = preferredThreadId || currentThreadId || data.threads[0]?.id;
+      if (nextThreadId) {
+        await loadThread(nextThreadId, data.threads);
+      }
+    }
+
+    async function loadThread(threadId, cachedThreads = null) {
+      const data = await fetchJson(`/api/threads/${threadId}`);
+      currentThreadId = data.thread.id;
+      renderMessages(data.messages);
+
+      const threads = cachedThreads || (await fetchJson("/api/threads")).threads;
+      renderThreads(threads);
+
+      const pendingApprovals = (await fetchJson("/api/approvals")).pending;
+      renderApprovals(pendingApprovals);
+
+      threadTitleEl.textContent = data.thread.title;
+      threadMetaEl.textContent = `${data.thread.status} · ${data.messages.length} Nachrichten · ${data.approvals.length} Freigaben gesamt`;
+      archiveThreadBtn.disabled = false;
+      resetThreadBtn.disabled = false;
+      deleteThreadBtn.disabled = false;
+      await refreshStatus();
+    }
+
+    async function createThread() {
+      const data = await fetchJson("/api/threads", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Neuer Chat" }),
+      });
+
+      statusEl.textContent = "Neuer Chat erstellt.";
+      await refreshThreads(data.thread.id);
+      renderMessages([]);
+    }
+
+    async function sendMessage() {
+      const message = messageInput.value.trim();
+
+      if (!message) {
+        statusEl.textContent = "Bitte zuerst eine Nachricht eingeben.";
+        return;
+      }
+
+      if (!currentThreadId) {
+        await createThread();
+      }
+
+      statusEl.textContent = "Manager bearbeitet die Nachricht...";
+      sendBtn.disabled = true;
+
+      try {
+        await fetchJson("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ thread_id: currentThreadId, message }),
+        });
+
+        messageInput.value = "";
+        statusEl.textContent = "Antwort erhalten.";
+        await loadThread(currentThreadId);
+      } catch (error) {
+        console.error(error);
+        statusEl.textContent = error.message || "Fehler beim Senden an das Backend.";
+      } finally {
+        sendBtn.disabled = false;
+      }
+    }
+
+    async function archiveCurrentThread() {
+      if (!currentThreadId) return;
+
+      await fetchJson(`/api/threads/${currentThreadId}/archive`, { method: "POST" });
+      statusEl.textContent = "Thread archiviert.";
+      await refreshThreads();
+    }
+
+    async function resetCurrentThread() {
+      if (!currentThreadId) return;
+
+      await fetchJson(`/api/threads/${currentThreadId}/reset`, { method: "POST" });
+      statusEl.textContent = "Thread zurückgesetzt.";
+      await loadThread(currentThreadId);
+    }
+
+    async function deleteCurrentThread() {
+      if (!currentThreadId) return;
+      const threadId = currentThreadId;
+      await fetchJson(`/api/threads/${threadId}`, { method: "DELETE" });
+      currentThreadId = null;
+      threadTitleEl.textContent = "Noch kein Chat ausgewählt";
+      threadMetaEl.textContent = "Der Manager arbeitet thread-basiert und behält Verlauf und Freigaben pro Chat.";
+      chatLog.innerHTML = "<div class='mini'>Dieser Chat wurde gelöscht.</div>";
+      archiveThreadBtn.disabled = true;
+      resetThreadBtn.disabled = true;
+      deleteThreadBtn.disabled = true;
+      statusEl.textContent = "Thread gelöscht.";
+      await refreshThreads();
+    }
+
+    async function approveRequest(approvalId) {
+      statusEl.textContent = "Freigabe wird ausgeführt...";
+      await fetchJson(`/api/approvals/${approvalId}/approve`, { method: "POST" });
+      await loadThread(currentThreadId);
+      statusEl.textContent = "Freigabe ausgeführt.";
+    }
+
+    async function rejectRequest(approvalId) {
+      statusEl.textContent = "Freigabe wird abgelehnt...";
+      await fetchJson(`/api/approvals/${approvalId}/reject`, { method: "POST" });
+      await loadThread(currentThreadId);
+      statusEl.textContent = "Freigabe abgelehnt.";
+    }
+
+    async function logout() {
+      await fetch("/api/logout", { method: "POST" });
+      window.location.href = "/login";
+    }
+
+    async function bootstrap() {
+      applyDisplayMode();
+      await fetchJson("/api/me");
+      await refreshStatus();
+      await refreshThreads(query.get("thread"));
+      const approvals = await fetchJson("/api/approvals");
+      renderApprovals(approvals.pending);
+    }
+
+    sendBtn.addEventListener("click", sendMessage);
+    logoutBtn.addEventListener("click", logout);
+    enablePushBtn.addEventListener("click", enablePush);
+    disablePushBtn.addEventListener("click", disablePush);
+    newThreadBtn.addEventListener("click", createThread);
+    archiveThreadBtn.addEventListener("click", archiveCurrentThread);
+    resetThreadBtn.addEventListener("click", resetCurrentThread);
+    deleteThreadBtn.addEventListener("click", deleteCurrentThread);
+
+    messageInput.addEventListener("keydown", (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        sendMessage();
+      }
+    });
+
+    const standaloneQuery = window.matchMedia("(display-mode: standalone)");
+    if (typeof standaloneQuery.addEventListener === "function") {
+      standaloneQuery.addEventListener("change", applyDisplayMode);
+    } else if (typeof standaloneQuery.addListener === "function") {
+      standaloneQuery.addListener(applyDisplayMode);
+    }
+
+    bootstrap().catch((error) => {
+      console.error(error);
+      statusEl.textContent = error.message;
+    });
+  </script>
+</body>
+</html>
