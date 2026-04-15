@@ -40,8 +40,45 @@ class HubStore:
     def add_message(self, thread_id: str, role: str, content: str, agent: str | None = None, meta: dict | None = None) -> dict:
         return sqlite_db.add_message(thread_id, role, content, agent=agent, meta=meta)
 
+    def update_message(
+        self,
+        message_id: int,
+        *,
+        content: str | None = None,
+        agent: str | None = None,
+        meta: dict | None = None,
+    ) -> dict | None:
+        return sqlite_db.update_message(
+            message_id,
+            content=content,
+            agent=agent,
+            meta=meta,
+        )
+
     def list_messages(self, thread_id: str) -> list[dict]:
         return sqlite_db.list_messages(thread_id)
+
+    def get_artifact(self, thread_id: str, kind: str) -> dict | None:
+        return sqlite_db.get_thread_artifact(thread_id, kind)
+
+    def list_artifacts(self, thread_id: str) -> list[dict]:
+        return sqlite_db.list_thread_artifacts(thread_id)
+
+    def upsert_artifact(
+        self,
+        thread_id: str,
+        kind: str,
+        title: str,
+        summary: str,
+        content: dict | None = None,
+    ) -> dict:
+        return sqlite_db.upsert_thread_artifact(
+            thread_id=thread_id,
+            kind=kind,
+            title=title,
+            summary=summary,
+            content=content,
+        )
 
     def create_approval_request(
         self,

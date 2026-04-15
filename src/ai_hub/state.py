@@ -18,8 +18,10 @@ class ApprovalStatus(StrEnum):
 
 class ManagerDecision(StrEnum):
     DIRECT = "direct"
+    PLAN = "plan"
     CODING = "coding"
     RESEARCH = "research"
+    REVIEW = "review"
 
 
 @dataclass(slots=True)

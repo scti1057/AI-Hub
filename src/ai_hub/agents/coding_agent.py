@@ -1,8 +1,12 @@
+import json
 import logging
 import re
+from pathlib import Path
 
 from ai_hub.language_policy import LanguagePolicy
 from ai_hub.logging_config import log_event, setup_logging
+from ai_hub.llm.model_router import ModelRouter
+from ai_hub.llm.ollama_client import LLMServiceError, OllamaClient
 from ai_hub.schemas.coding_delegation import CodingDelegationPlan
 from ai_hub.schemas.coding_actions import (
     CodingAction,
@@ -47,8 +51,15 @@ IGNORED_DIRECTORY_TOKENS = {
 class CodingAgent:
     role = "coding"
 
-    def __init__(self, language_policy: LanguagePolicy | None = None) -> None:
+    def __init__(
+        self,
+        language_policy: LanguagePolicy | None = None,
+        client: OllamaClient | None = None,
+    ) -> None:
         self.language_policy = language_policy or LanguagePolicy()
+        self.client = client or OllamaClient()
+        self.model = ModelRouter.get_model_for_role("coding")
+        self.system_prompt = self._load_system_prompt()
 
     def handle_task(
         self,
@@ -62,10 +73,14 @@ class CodingAgent:
         workspace = file_tools.ensure_thread_workspace(thread_id)
         internal_task = internal_task or language_context.internal_message
         blocked_path = self._detect_blocked_path_request(user_task)
-        action_batch, structured_plan_used, fallback_to_heuristic, plan_validation_success = self._resolve_action_batch(
-            user_task,
-            structured_plan,
-        )
+        try:
+            action_batch, structured_plan_used, fallback_to_heuristic, plan_validation_success = self._resolve_action_batch(
+                user_task,
+                structured_plan,
+            )
+        except Exception as exc:
+            log_event(logger, "coding_error", thread_id=thread_id, model=self.model, error=str(exc))
+            return self._error_result(thread_id, internal_task, language_context.user_language, exc)
         action_types = [action.action_type for action in action_batch.actions]
 
         log_event(
@@ -327,7 +342,13 @@ class CodingAgent:
         actions_executed = [result.model_dump() for result in executed]
         actions_blocked = [result.model_dump() for result in blocked]
         approval_request_created = approval_request is not None
-        internal_summary = self._build_internal_summary(executed, blocked, approval_request_created)
+        self_check = self._build_self_check(
+            thread_id=thread_id,
+            executed=executed,
+            blocked=blocked,
+            approval_request=approval_request,
+        )
+        internal_summary = self._build_internal_summary(executed, blocked, approval_request_created, self_check)
 
         if blocked:
             status = "blocked"
@@ -358,7 +379,60 @@ class CodingAgent:
             "tool_results": self._tool_results_from_action_results(executed, blocked),
             "workspace": workspace,
             "internal_summary": internal_summary,
-            "internal_payload": self._build_internal_payload(internal_task, thread_id),
+            "internal_payload": self._build_internal_payload(internal_task, thread_id, self_check=self_check),
+        }
+
+    def _error_result(self, thread_id: str, internal_task: str, user_language: str, exc: Exception) -> dict:
+        code = getattr(exc, "code", "coding_llm_error")
+        status_code = getattr(exc, "status_code", None)
+        details = str(exc).strip() or code
+        if user_language == "de":
+            reply = (
+                "Coding-Agent Fehler:\n"
+                f"- Modell: `{self.model}`\n"
+                f"- Fehlercode: `{code}`\n"
+                f"- Details: {details}"
+            )
+            if status_code is not None:
+                reply += f"\n- HTTP-Status: `{status_code}`"
+        else:
+            reply = (
+                "Coding agent error:\n"
+                f"- Model: `{self.model}`\n"
+                f"- Error code: `{code}`\n"
+                f"- Details: {details}"
+            )
+            if status_code is not None:
+                reply += f"\n- HTTP status: `{status_code}`"
+        return {
+            "reply": reply,
+            "user_reply": reply,
+            "status": "error",
+            "approval_request": None,
+            "approval_request_created": False,
+            "actions_executed": [],
+            "actions_blocked": [],
+            "tool_results": [],
+            "workspace": str(file_tools.ensure_thread_workspace(thread_id)),
+            "internal_summary": f"Coding agent failed with {code}.",
+            "internal_payload": {
+                "language": "en",
+                "thread_id": thread_id,
+                "task": internal_task,
+                "policy": (
+                    "Use English for internal routing, worker handoffs, prompts, and tool instructions. "
+                    "Keep user-facing communication in the user's language."
+                ),
+                "source": "error",
+                "model": self.model,
+                "error": {
+                    "code": code,
+                    "message": details,
+                    "status_code": status_code,
+                    "exception_type": type(exc).__name__,
+                    "is_llm_error": isinstance(exc, LLMServiceError),
+                },
+            },
         }
 
     def _tool_results_from_action_results(
@@ -383,14 +457,17 @@ class CodingAgent:
         executed: list[CodingActionResult],
         blocked: list[CodingActionResult],
         approval_request_created: bool,
+        self_check: dict,
     ) -> str:
         executed_types = ", ".join(result.action_type for result in executed) or "none"
         blocked_types = ", ".join(result.action_type for result in blocked) or "none"
         approval_state = "yes" if approval_request_created else "no"
+        self_check_summary = self_check.get("summary", "No self-check summary.")
         return (
             f"Executed actions: {executed_types}. "
             f"Blocked actions: {blocked_types}. "
-            f"Approval request created: {approval_state}."
+            f"Approval request created: {approval_state}. "
+            f"Self-check: {self_check_summary}"
         )
 
     def _build_execution_request(
@@ -432,7 +509,7 @@ class CodingAgent:
             ),
         }
 
-    def _build_internal_payload(self, internal_task: str, thread_id: str) -> dict:
+    def _build_internal_payload(self, internal_task: str, thread_id: str, self_check: dict | None = None) -> dict:
         return {
             "language": "en",
             "thread_id": thread_id,
@@ -441,10 +518,83 @@ class CodingAgent:
                 "Use English for internal routing, worker handoffs, prompts, and tool instructions. "
                 "Keep user-facing communication in the user's language."
             ),
+            "self_check": self_check or {},
+        }
+
+    def _build_self_check(
+        self,
+        thread_id: str,
+        executed: list[CodingActionResult],
+        blocked: list[CodingActionResult],
+        approval_request: dict | None,
+    ) -> dict:
+        inspected_files: list[dict] = []
+        touched_paths: list[str] = []
+        for result in executed:
+            target = result.target
+            if not target:
+                continue
+            touched_paths.append(target)
+            if result.action_type not in {"create_file", "read_file"}:
+                continue
+            try:
+                content = file_tools.read_file(thread_id, target)
+            except Exception:
+                continue
+            inspected_files.append(
+                {
+                    "path": target,
+                    "preview": content[:240],
+                    "bytes": len(content.encode("utf-8")),
+                }
+            )
+
+        follow_up: list[str] = []
+        if blocked:
+            follow_up.append("Resolve the blocked step before expanding the implementation scope.")
+        if approval_request is not None:
+            follow_up.append("Runtime validation is still pending user approval.")
+
+        created_python_files = [
+            result.target
+            for result in executed
+            if result.action_type == "create_file" and str(result.target or "").endswith(".py")
+        ]
+        if created_python_files and approval_request is None:
+            follow_up.append("No runtime validation has been requested yet for the changed Python files.")
+        if not executed and not blocked:
+            follow_up.append("No concrete workspace mutation happened in this step.")
+
+        summary_parts = []
+        if inspected_files:
+            preview_paths = ", ".join(item["path"] for item in inspected_files[:3])
+            summary_parts.append(f"Inspected files after execution: {preview_paths}.")
+        else:
+            summary_parts.append("No file contents were re-read after execution.")
+        if follow_up:
+            summary_parts.append("Follow-up: " + " ".join(follow_up[:3]))
+        else:
+            summary_parts.append("No immediate follow-up risk was detected from the executed action batch.")
+
+        return {
+            "inspected_files": inspected_files,
+            "touched_paths": touched_paths,
+            "follow_up": follow_up,
+            "summary": " ".join(summary_parts).strip(),
         }
 
     def build_action_batch_from_text(self, user_task: str) -> CodingActionBatch:
         return self._build_action_batch(user_task)
+
+    def build_action_batch_from_llm(
+        self,
+        user_task: str,
+        internal_task: str | None = None,
+    ) -> CodingActionBatch | None:
+        prompt = self._build_llm_prompt(user_task=user_task, internal_task=internal_task or user_task)
+        log_event(logger, "coding_ollama_request", model=self.model)
+        response = self.client.generate(model=self.model, prompt=prompt, temperature=0.1)
+        return self._parse_llm_action_batch(response)
 
     def _resolve_action_batch(
         self,
@@ -455,12 +605,67 @@ class CodingAgent:
             batch = structured_plan.actions
             if batch.actions:
                 return batch, True, False, True
-            return self._build_action_batch(user_task), False, True, False
+            raise ValueError("Structured coding plan is empty.")
         if isinstance(structured_plan, CodingActionBatch):
             if structured_plan.actions:
                 return structured_plan, True, False, True
-            return self._build_action_batch(user_task), False, True, False
-        return self._build_action_batch(user_task), False, True, False
+            raise ValueError("Structured coding action batch is empty.")
+        llm_batch = self.build_action_batch_from_llm(user_task)
+        if llm_batch is None or not llm_batch.actions:
+            raise ValueError("Coding agent returned no executable actions.")
+        return llm_batch, True, False, True
+
+    def _load_system_prompt(self) -> str:
+        prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "coding_agent.txt"
+        return prompt_path.read_text(encoding="utf-8").strip()
+
+    def _build_llm_prompt(self, user_task: str, internal_task: str) -> str:
+        return f"""
+{self.system_prompt}
+
+You are working inside a local multi-agent backend with strict server-side safety controls.
+Translate the request into a conservative structured coding action batch.
+Only use supported action types and only return actions that fit the user's request.
+If the internal task already defines a bounded implementation slice, you may write meaningful starter code and tests that fit that slice.
+Do not return placeholder-only files when the request clearly expects real implementation progress.
+Only leave file content empty when the file is intentionally empty, such as a package marker file.
+Never return absolute paths or parent-directory escapes.
+If no safe coding action is clear, return an empty action list.
+
+Supported action schema examples:
+{{
+  "actions": [
+    {{"action_type": "make_directory", "path": "demo"}},
+    {{"action_type": "create_file", "path": "demo/notes.txt", "content": "", "content_inferred": false}},
+    {{"action_type": "read_file", "path": "demo/notes.txt"}},
+    {{"action_type": "delete_path", "path": "demo/notes.txt"}},
+    {{"action_type": "list_files", "path": "."}},
+    {{"action_type": "request_execution", "target": "src/main.py"}}
+  ]
+}}
+
+Original user task:
+{user_task}
+
+Internal worker task:
+{internal_task}
+
+Return JSON only with this shape:
+{{
+  "actions": [...]
+}}
+""".strip()
+
+    def _parse_llm_action_batch(self, response: str) -> CodingActionBatch:
+        json_match = re.search(r"\{.*\}", response, flags=re.DOTALL)
+        if not json_match:
+            raise ValueError("Coding agent did not return JSON.")
+        payload = json.loads(json_match.group(0))
+        if "actions" in payload and isinstance(payload["actions"], list):
+            return CodingActionBatch.model_validate(payload)
+        if "actions" in payload and isinstance(payload["actions"], dict):
+            return CodingActionBatch.model_validate(payload["actions"])
+        raise ValueError("Coding agent JSON does not contain a valid action batch.")
 
     def _build_action_batch(self, user_task: str) -> CodingActionBatch:
         directory = self._clean_directory_value(self._extract_directory_request(user_task))

@@ -1,6 +1,7 @@
 from ai_hub.language_policy import LanguagePolicy
 from ai_hub.agents.coding_agent import CodingAgent
 from ai_hub.agents.research_agent import ResearchAgent
+from ai_hub.agents.reviewer_agent import ReviewerAgent
 from ai_hub.schemas.coding_delegation import CodingDelegationPlan
 from ai_hub.state import ManagerDecision
 
@@ -10,6 +11,7 @@ class DelegationService:
         self.language_policy = LanguagePolicy()
         self.coding_agent = CodingAgent(language_policy=self.language_policy)
         self.research_agent = ResearchAgent()
+        self.reviewer_agent = ReviewerAgent()
 
     def execute(
         self,
@@ -30,13 +32,15 @@ class DelegationService:
             )
         if decision == ManagerDecision.RESEARCH:
             return self.research_agent.handle_task(thread_id, user_task, history, internal_task=internal_task)
+        if decision == ManagerDecision.REVIEW:
+            return self.reviewer_agent.handle_task(thread_id, user_task, history, internal_task=internal_task)
         raise ValueError(f"Unsupported delegation decision: {decision}")
 
     def prepare_coding_plan(self, user_task: str) -> CodingDelegationPlan:
-        batch = self.coding_agent.build_action_batch_from_text(user_task)
+        batch = self.coding_agent.build_action_batch_from_llm(user_task)
         return CodingDelegationPlan(
-            summary="Fallback structured coding delegation plan.",
-            rationale="Derived from the user request with conservative local parsing.",
+            summary="Structured coding delegation plan.",
+            rationale="Derived from the coding agent model.",
             approval_needed=any(action.action_type == "request_execution" for action in batch.actions),
             actions=batch,
         )

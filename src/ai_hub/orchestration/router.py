@@ -53,6 +53,19 @@ RESEARCH_KEYWORDS = {
     "quelle",
 }
 
+REVIEW_KEYWORDS = {
+    "review",
+    "reviewer",
+    "kritik",
+    "kritiker",
+    "prüfe",
+    "pruefe",
+    "bewerte",
+    "critique",
+    "critic",
+    "kritisch",
+}
+
 STRATEGIC_PHRASES = (
     "wie würdest du",
     "how would you",
@@ -73,6 +86,8 @@ class ManagerRouter:
 
         has_coding_noun = any(keyword in tokens for keyword in CODING_NOUNS)
         has_coding_verb = any(keyword in tokens for keyword in CODING_VERBS)
+        has_research_keyword = any(keyword in tokens for keyword in RESEARCH_KEYWORDS)
+        has_review_keyword = any(keyword in tokens for keyword in REVIEW_KEYWORDS)
         has_file_extension = bool(re.search(r"\b[\w./-]+\.(py|txt|md|json|yaml|yml|csv)\b", lowered))
         has_workspace_phrase = "workspace" in tokens or "sandbox" in tokens
         has_execution_phrase = any(
@@ -91,6 +106,18 @@ class ManagerRouter:
         )
         has_strategic_phrase = any(phrase in lowered for phrase in STRATEGIC_PHRASES)
 
+        if has_review_keyword:
+            return RouteDecision(
+                decision=ManagerDecision.REVIEW,
+                reason="Die Anfrage wirkt wie eine Prüfung, Kritik oder Zweitmeinung.",
+            )
+
+        if has_research_keyword:
+            return RouteDecision(
+                decision=ManagerDecision.RESEARCH,
+                reason="Die Anfrage wirkt analysierend oder recherchelastig.",
+            )
+
         if has_strategic_phrase and not has_execution_phrase and not has_delete_phrase:
             return RouteDecision(
                 decision=ManagerDecision.DIRECT,
@@ -107,12 +134,6 @@ class ManagerRouter:
             return RouteDecision(
                 decision=ManagerDecision.CODING,
                 reason="Die Anfrage wirkt code- oder workspace-bezogen.",
-            )
-
-        if any(keyword in tokens for keyword in RESEARCH_KEYWORDS):
-            return RouteDecision(
-                decision=ManagerDecision.RESEARCH,
-                reason="Die Anfrage wirkt analysierend oder recherchelastic.",
             )
 
         return RouteDecision(

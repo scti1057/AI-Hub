@@ -79,6 +79,22 @@ def init_db() -> None:
             )
             """
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thread_artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                content_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE,
+                UNIQUE(thread_id, kind)
+            )
+            """
+        )
         con.commit()
 
 
@@ -125,6 +141,19 @@ def _approval_to_dict(row: sqlite3.Row) -> dict:
         "updated_at": row["updated_at"],
         "decided_at": row["decided_at"],
         "executed_at": row["executed_at"],
+    }
+
+
+def _artifact_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "thread_id": row["thread_id"],
+        "kind": row["kind"],
+        "title": row["title"],
+        "summary": row["summary"],
+        "content": json.loads(row["content_json"] or "{}"),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
     }
 
 
@@ -212,6 +241,7 @@ def reset_thread(thread_id: str) -> dict | None:
     now = _now()
     with get_connection() as con:
         con.execute("DELETE FROM messages WHERE thread_id = ?", (thread_id,))
+        con.execute("DELETE FROM thread_artifacts WHERE thread_id = ?", (thread_id,))
         con.execute(
             """
             UPDATE approval_requests
@@ -273,6 +303,51 @@ def add_message(
     return _message_to_dict(row)
 
 
+def update_message(
+    message_id: int,
+    *,
+    content: str | None = None,
+    agent: str | None = None,
+    meta: dict | None = None,
+) -> dict | None:
+    updates: list[str] = []
+    params: list[object] = []
+
+    if content is not None:
+        updates.append("content = ?")
+        params.append(content)
+    if agent is not None:
+        updates.append("agent = ?")
+        params.append(agent)
+    if meta is not None:
+        updates.append("meta_json = ?")
+        params.append(json.dumps(meta, separators=(",", ":")))
+
+    if not updates:
+        with get_connection() as con:
+            row = con.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+        return _message_to_dict(row) if row is not None else None
+
+    with get_connection() as con:
+        thread_row = con.execute("SELECT thread_id FROM messages WHERE id = ?", (message_id,)).fetchone()
+        if thread_row is None:
+            return None
+        now = _now()
+        params.extend([message_id])
+        con.execute(
+            f"UPDATE messages SET {', '.join(updates)} WHERE id = ?",
+            tuple(params),
+        )
+        con.execute(
+            "UPDATE threads SET updated_at = ? WHERE id = ?",
+            (now, thread_row["thread_id"]),
+        )
+        con.commit()
+
+        row = con.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+    return _message_to_dict(row)
+
+
 def list_messages(thread_id: str) -> list[dict]:
     with get_connection() as con:
         rows = con.execute(
@@ -285,6 +360,73 @@ def list_messages(thread_id: str) -> list[dict]:
             (thread_id,),
         ).fetchall()
     return [_message_to_dict(row) for row in rows]
+
+
+def get_thread_artifact(thread_id: str, kind: str) -> dict | None:
+    with get_connection() as con:
+        row = con.execute(
+            """
+            SELECT *
+            FROM thread_artifacts
+            WHERE thread_id = ? AND kind = ?
+            """,
+            (thread_id, kind),
+        ).fetchone()
+    return _artifact_to_dict(row) if row is not None else None
+
+
+def list_thread_artifacts(thread_id: str) -> list[dict]:
+    with get_connection() as con:
+        rows = con.execute(
+            """
+            SELECT *
+            FROM thread_artifacts
+            WHERE thread_id = ?
+            ORDER BY updated_at DESC, id DESC
+            """,
+            (thread_id,),
+        ).fetchall()
+    return [_artifact_to_dict(row) for row in rows]
+
+
+def upsert_thread_artifact(
+    thread_id: str,
+    kind: str,
+    title: str,
+    summary: str,
+    content: dict | None = None,
+) -> dict:
+    now = _now()
+    with get_connection() as con:
+        con.execute(
+            """
+            INSERT INTO thread_artifacts (thread_id, kind, title, summary, content_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(thread_id, kind) DO UPDATE SET
+                title = excluded.title,
+                summary = excluded.summary,
+                content_json = excluded.content_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                thread_id,
+                kind,
+                title.strip() or kind,
+                summary.strip(),
+                json.dumps(content or {}, separators=(",", ":")),
+                now,
+                now,
+            ),
+        )
+        con.execute(
+            "UPDATE threads SET updated_at = ? WHERE id = ?",
+            (now, thread_id),
+        )
+        con.commit()
+    artifact = get_thread_artifact(thread_id, kind)
+    if artifact is None:
+        raise RuntimeError(f"Artifact upsert failed for {thread_id}:{kind}")
+    return artifact
 
 
 def create_approval_request(

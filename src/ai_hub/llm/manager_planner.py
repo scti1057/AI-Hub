@@ -38,7 +38,7 @@ class ManagerPlanner:
         user_language: str = "de",
     ) -> dict | None:
         if not self.enabled or not self.ollama_enabled:
-            return None
+            raise RuntimeError("Manager planner is disabled.")
 
         prompt = f"""
 {self.system_prompt}
@@ -48,6 +48,9 @@ You may help understand the request, choose the route, and draft the user-facing
 You must never bypass approval rules, workspace restrictions, or backend tool policies.
 Internal worker instructions must be written in English.
 The user-facing reply must be written in this language code: {user_language}.
+When you choose decision="coding" for a bounded implementation slice, prefer meaningful file contents over empty stubs.
+Only use empty file contents when the file is intentionally a placeholder such as an empty __init__.py.
+If the user asked for a project structure or a concrete first slice, the coding_plan should create a coherent small implementation, not only comments or placeholder headings.
 
 Recent thread context:
 {history_text}
@@ -58,7 +61,7 @@ New user message:
 Return JSON only with these fields:
 {{
   "summary": "short summary",
-  "decision": "direct|coding|research",
+  "decision": "direct|plan|coding|research|review",
   "reason": "why this route",
   "user_reply": "short user-facing reply in the user's language",
   "internal_task_for_worker": "English instruction for the worker or empty string",
@@ -79,6 +82,7 @@ Return JSON only with these fields:
   }}
 }}
 
+Use decision="plan" when the user wants strategy, architecture, milestones, implementation slices, or feedback before coding starts.
 Only include a non-empty coding_plan when decision="coding". Otherwise set coding_plan to null.
 """.strip()
 

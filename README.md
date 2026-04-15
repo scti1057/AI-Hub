@@ -13,6 +13,7 @@ AI Hub is a local/private orchestration platform for:
 - a web-based chat interface
 - persistent thread-based conversations
 - a manager agent backed by Ollama
+- specialized coding, research, and review agents backed by Ollama
 - bounded worker delegation
 - approval-gated Python execution
 - workspace-restricted coding tasks
@@ -24,6 +25,7 @@ The system is intentionally conservative. It is not trying to be a fully autonom
 - human approval before execution
 - strict workspace boundaries
 - incremental delegation instead of uncontrolled autonomy
+- reusable thread-level project memory instead of raw full-history prompting
 
 ### Vision
 
@@ -31,7 +33,7 @@ The long-term vision is a usable private multi-agent assistant where:
 
 - the user primarily interacts with a manager agent
 - the manager maintains context across threads
-- coding and research workers operate in specialized roles
+- coding, research, and review workers operate in specialized roles
 - risky actions require explicit human approval
 - local models via Ollama provide natural language planning and responses
 - the system remains safe enough to use from mobile devices
@@ -54,8 +56,16 @@ The following are implemented and testable today:
 - private FastAPI web app
 - session login
 - persistent thread/chat model in SQLite
-- manager workflow with Ollama plus safe fallback
+- manager workflow with Ollama and visible error reporting
 - coding delegation with structured internal actions
+- research delegation with LLM-backed analytical output
+- review delegation with LLM-backed critical second-opinion output
+- thread-scoped project artifacts for reusable internal memory
+- manager-side project planning route for roadmap-first collaboration
+- manager-side pre-coding consultation via research and review for larger coding requests
+- coding self-check summaries after each action batch
+- post-coding implementation review by the reviewer agent when the slice is substantive enough
+- provider-backed web search for the research agent with optional page previews
 - approval requests for Python execution
 - execution after user approval
 - workspace-restricted file operations
@@ -69,6 +79,9 @@ The following are implemented and testable today:
 
 - Private web app with login
 - Thread-based chat UX
+- Immediate local message rendering after send
+- Persistent Thinking indicator with live elapsed time in the thread
+- Short live status comment below the Thinking indicator
 - Mobile usage via iPhone home-screen web app
 - Tailscale-based private remote access
 - Push notifications when an approval is needed
@@ -77,10 +90,15 @@ The following are implemented and testable today:
 
 - Natural user interaction
 - Thread-aware context handling
-- Routing between direct answer, coding delegation, and research delegation
-- Ollama-backed planning with safe fallback behavior
+- Compact project-memory reuse across turns
+- Routing between direct answer, project planning, coding delegation, research delegation, and review delegation
+- Ollama-backed planning with explicit in-chat error feedback
+- Project-plan synthesis with manager-owned next-step proposals and feedback checkpoints
+- Project-state tracking across turns so follow-up feedback can resume the next slice
+- Internal research + review consultation before larger coding tasks
+- External/web research via the research agent when configured
 - Approval coordination
-- Logging of routing, fallback, and delegation decisions
+- Logging of routing, delegation decisions, and LLM failures
 
 ### Coding capabilities
 
@@ -94,7 +112,17 @@ The following are implemented and testable today:
   - `list_files`
 - Multi-step action batches
 - Structured action results
+- Internal self-check summaries for touched files and obvious follow-up risks
 - Approval request creation only after the required file exists
+- LLM-driven action planning without silent heuristic fallback
+
+### Research capabilities
+
+- Read-only analytical research responses
+- Optional provider-backed web search
+- Optional page-preview fetching for top web results
+- Source metadata returned in internal research payloads
+- Reusable research artifacts stored per thread
 
 ### Execution capabilities
 
@@ -107,7 +135,7 @@ The following are implemented and testable today:
 
 ### High-level architecture
 
-`User -> Web App/API -> Manager Workflow -> Routing/Planning -> Worker Delegation -> Tools -> Approval/Execution`
+`User -> Web App/API -> Manager Workflow -> Planning + Project Memory -> Optional Research/Review Consultation -> Worker Delegation -> Tools -> Approval/Execution`
 
 ### Main components
 
@@ -122,7 +150,7 @@ The web layer lives in [app.py](src/ai_hub/web/app.py) and serves:
 - login/session handling
 - static web UI
 - thread APIs
-- chat API
+- asynchronous chat enqueue API
 - approval APIs
 - push subscription APIs
 
@@ -134,31 +162,42 @@ The manager runtime is implemented in [workflow.py](src/ai_hub/orchestration/wor
 
 - storing user messages
 - preparing manager planning input
+- enriching that planning input with compact thread-scoped project memory
 - calling the Ollama-backed planner
-- combining planner output with safe routing policy
+- validating and applying the structured planner result
+- consulting research and review workers before larger coding tasks
 - delegating to workers
 - creating approval requests
+- surfacing LLM and orchestration errors back into the chat thread
+- completing pending assistant messages that were enqueued by the web API
 - sending push notifications
 
 The manager prompt is in [manager.txt](src/ai_hub/prompts/manager.txt).
 
 #### Coding agent
 
-The coding worker is implemented in [coding_agent.py](src/ai_hub/agents/coding_agent.py). It now runs on structured internal actions rather than directly on free-form tool parsing.
+The coding worker is implemented in [coding_agent.py](src/ai_hub/agents/coding_agent.py). It runs on structured internal actions and uses its dedicated model to plan action batches.
 
 Its execution pipeline is:
 
 1. receive a structured delegation plan if available
-2. otherwise derive a structured action batch from text
-3. execute actions in order
-4. return structured execution results
-5. optionally prepare an approval request
+2. otherwise request a structured action batch from the coding model
+3. inherit manager-prepared decomposition context for larger tasks when available
+4. execute actions in order
+5. build a compact self-check summary from the changed files and pending follow-up risks
+6. return structured execution results
+7. optionally prepare an approval request
 
-The coding prompt file exists in [coding_agent.txt](src/ai_hub/prompts/coding_agent.txt), but the current execution path is mostly server-side and structured rather than prompt-driven.
+The coding prompt is in [coding_agent.txt](src/ai_hub/prompts/coding_agent.txt).
 
 #### Research agent
 
-The research worker is currently intentionally lightweight and read-oriented. It is implemented in [research_agent.py](src/ai_hub/agents/research_agent.py). At the moment it acts more as an analytical placeholder than a fully developed agent.
+The research worker is implemented in [research_agent.py](src/ai_hub/agents/research_agent.py). It uses its dedicated model to produce structured analytical output for comparisons, summaries, and open questions. It is read-only and does not touch the coding workspace.
+When configured, it can enrich its prompt with provider-backed web search results and fetched page previews before synthesizing an answer.
+
+#### Reviewer agent
+
+The review worker is implemented in [reviewer_agent.py](src/ai_hub/agents/reviewer_agent.py). It acts as a critical second opinion for plans, implementation ideas, and results. It is read-only and focuses on risks, gaps, regressions, and missing checks.
 
 #### Structured schemas
 
@@ -170,6 +209,23 @@ Important internal schemas live in [src/ai_hub/schemas](src/ai_hub/schemas):
 
 These schemas are important because they define the structured contract between manager planning and coding execution.
 
+#### Thread artifacts / project memory
+
+In addition to raw chat messages, AI Hub now stores compact thread-scoped artifacts in SQLite so that key internal state can be reused without replaying the whole conversation.
+
+Current artifact categories include:
+
+- `project_brief`
+- `project_plan`
+- `project_state`
+- `research_notes`
+- `web_research_notes`
+- `review_notes`
+- `coding_status`
+- `implementation_review`
+
+These artifacts are reused by the manager as compact planning context and are also exposed through the thread API.
+
 #### Workspace tools
 
 Low-level coding tools live in [file_tools.py](src/ai_hub/tools/file_tools.py). They enforce:
@@ -178,6 +234,15 @@ Low-level coding tools live in [file_tools.py](src/ai_hub/tools/file_tools.py). 
 - relative-path-only access
 - path escape blocking
 - sensitive path blocking
+
+#### Web research tools
+
+Web-search integration lives in [web_search.py](src/ai_hub/tools/web_search.py). The current implementation supports provider-backed search with:
+
+- `Brave Search API`
+- `Tavily Search API`
+
+The provider is selected through configuration. When enabled, the research agent can search the web, attach compact source metadata, and fetch short page previews for the top results.
 
 #### Approval and execution
 
@@ -189,13 +254,21 @@ Push behavior is implemented in [push_notify.py](src/ai_hub/tools/push_notify.py
 
 #### Ollama integration
 
-The manager’s Ollama integration lives in:
+Ollama integration lives in:
 
 - [manager_planner.py](src/ai_hub/llm/manager_planner.py)
 - [ollama_client.py](src/ai_hub/llm/ollama_client.py)
 - [model_router.py](src/ai_hub/llm/model_router.py)
 
-The manager uses Ollama for planning and drafting, but the backend still enforces safety decisions.
+The currently configured role-to-model mapping is:
+
+- manager: `gemma4:31b`
+- coding: `qwen3-coder:30b`
+- research: `qwen3:30b`
+- reviewer: `deepseek-r1:32b-qwen-distill-q4_K_M`
+
+The backend still enforces safety, workspace limits, and approval rules independently of any model output.
+Web research remains provider-gated and configuration-driven; it is not silently enabled without a configured search backend.
 
 #### Logging
 
@@ -206,37 +279,92 @@ Central logging configuration is in [logging_config.py](src/ai_hub/logging_confi
 ### Step-by-step flow
 
 1. The user sends a chat message through the web app.
-2. `POST /api/chat` in [app.py](src/ai_hub/web/app.py) forwards the request into the manager workflow.
-3. The manager ensures a thread exists, stores the user message, and formats recent thread history.
-4. The manager planner asks Ollama for a structured plan.
-5. The workflow combines:
-   - safe local routing policy
-   - structured manager plan from Ollama
-6. The result is one of:
+2. The frontend shows the user message immediately in the chat log.
+3. `POST /api/chat` in [app.py](src/ai_hub/web/app.py) creates or reuses the thread, stores the user message, and writes a pending assistant message.
+4. The frontend renders that pending assistant message as a Thinking state with animated dots and a live timer.
+5. The frontend shows a short live status comment under Thinking, for example which phase or worker is currently active.
+6. A background worker in the backend processes the queued message through the manager workflow.
+7. The manager planner asks Ollama for a structured plan.
+8. The workflow validates the structured manager plan from Ollama.
+9. For strategic or roadmap-style requests, the manager may switch into a dedicated planning route before coding starts.
+10. In that planning route, the manager consults the research and reviewer workers internally and comes back with a project proposal plus feedback questions.
+11. For larger coding requests, the manager may still consult the research and reviewer workers internally before choosing the next bounded coding slice.
+12. After coding work, the manager may ask the reviewer agent to critique the latest implementation step using the coding summary and self-check.
+13. The manager stores compact project artifacts such as project plans, project state, research notes, review notes, project briefs, coding status, and implementation reviews.
+14. The result is one of:
    - direct manager reply
+   - project plan
    - coding delegation
    - research delegation
-7. If the route is `coding`, the manager tries to provide a structured `CodingDelegationPlan`.
-8. The coding agent prefers that structured plan.
-9. If no valid structured plan is available, the coding agent falls back to building a structured action batch from text.
-10. The coding agent executes actions through the server-side tool layer.
-11. If execution is requested, the coding agent prepares an approval request instead of running Python directly.
-12. The manager stores the approval request and sends a push notification.
-13. The user approves or rejects the execution in the web app.
-14. If approved, the backend validates the command again and runs Python through `bubblewrap` when possible.
-15. The result is stored in the thread and logged.
+   - review delegation
+15. If the route is `research`, the research agent may use configured web search and page previews when the task depends on current or external information.
+16. If the route is `coding`, the manager may provide a structured `CodingDelegationPlan`.
+17. The coding agent prefers that structured plan.
+18. If no structured coding plan is provided, the coding agent requests a structured action batch from its own model.
+19. The coding agent executes actions through the server-side tool layer.
+20. If execution is requested, the coding agent prepares an approval request instead of running Python directly.
+21. The manager stores the approval request and sends a push notification.
+22. The pending assistant message is updated in place with the final manager reply or an explicit error.
+23. The frontend polls the active thread while a Thinking message exists and stops polling when processing is finished.
+24. Only the latest still-open processing message is rendered as an active Thinking block in the UI.
+25. The user approves or rejects execution requests in the web app.
+26. If approved, the backend validates the command again and runs Python through `bubblewrap` when possible.
+27. Successful and failed results are logged.
+
+### Project planning flow
+
+For collaborative multi-turn project work, the manager can now run a dedicated planning loop before coding starts:
+
+1. interpret the request as a project-planning task instead of immediate implementation
+2. ask the research agent for feasibility, architecture direction, repo shape, milestones, and the safest first slice
+3. ask the reviewer agent to challenge scope, missing validation, and places where user confirmation should be requested
+4. synthesize both results into a manager-owned proposal
+5. store that proposal as `project_plan` and `project_state`
+6. come back to the user with a concrete recommendation and explicit feedback points
+
+This makes the manager more suitable for long-running collaborative project delivery instead of one-shot coding only.
+
+After a project plan is stored, short user replies such as approval, agreement, or "continue" can now resume the next bounded coding slice from that saved project state instead of restarting from scratch.
+
+### Internal consultation flow for larger coding tasks
+
+For coding requests that look too large for a one-shot implementation, the manager now follows a conservative internal loop:
+
+1. ask the research agent to break the request into smaller work packages, assumptions, and risks
+2. ask the reviewer agent to critique that decomposition and challenge oversized scope
+3. compress both results into thread-scoped artifacts
+4. pass the smallest safe next slice to the coding agent
+5. let the coding agent produce a self-check summary after execution
+6. let the reviewer agent critique the latest coding step when the slice is substantive enough to justify the extra loop
+
+This keeps the external UX manager-centric while allowing more natural internal multi-step coordination.
+
+### Web research flow
+
+When web research is enabled and the task calls for external/current information, the research path becomes:
+
+1. derive a compact search query from the research task
+2. call the configured search provider
+3. fetch short previews for the top result pages
+4. hand both snippets and previews to the research model
+5. store source metadata and summarized findings in thread artifacts
+
+When source metadata exists, the workflow additionally stores a dedicated `web_research_notes` artifact so later manager and reviewer steps can reuse externally grounded findings without rerunning the search immediately.
 
 ### Textual flow diagram
 
 `User`
 -> `FastAPI /api/chat`
+-> `store user message + pending assistant message`
+-> `background worker`
 -> `ManagerWorkflow`
--> `ManagerPlanner (Ollama + fallback)`
--> `Router + policy merge`
+-> `ManagerPlanner (Ollama)`
+-> `LLM plan / explicit error response`
 -> `DelegationService`
--> `CodingAgent / ResearchAgent`
+-> `CodingAgent / ResearchAgent / ReviewerAgent`
 -> `Workspace tools / approval system`
--> `Push + thread update`
+-> `pending message updated in place`
+-> `frontend polling refresh`
 -> `User`
 
 ### Approval flow
@@ -310,12 +438,13 @@ The LLM cannot:
 - force arbitrary file access
 - directly execute Python outside backend policy
 
-### Fallback behavior
+### LLM failure behavior
 
-If Ollama is unavailable, misconfigured, or returns an unusable plan:
+If Ollama is unavailable, misconfigured, or returns unusable output:
 
-- the manager falls back to deterministic backend logic
-- routing still works
+- the failing component returns an explicit error into the chat thread
+- the error includes model and failure details when available
+- no silent heuristic substitution is used for manager planning or worker reasoning
 - safety rules remain unchanged
 
 ## Important Project Files and Directories
@@ -338,13 +467,13 @@ If Ollama is unavailable, misconfigured, or returns an unusable plan:
 #### Agents
 
 - [agents/manager.py](src/ai_hub/agents/manager.py): simple manager entrypoint wrapper
-- [agents/coding_agent.py](src/ai_hub/agents/coding_agent.py): structured coding action execution
-- [agents/research_agent.py](src/ai_hub/agents/research_agent.py): current research placeholder
+- [agents/coding_agent.py](src/ai_hub/agents/coding_agent.py): LLM-backed structured coding action planning and execution
+- [agents/research_agent.py](src/ai_hub/agents/research_agent.py): LLM-backed read-only research worker
+- [agents/reviewer_agent.py](src/ai_hub/agents/reviewer_agent.py): LLM-backed read-only reviewer worker
 
 #### Orchestration
 
 - [orchestration/workflow.py](src/ai_hub/orchestration/workflow.py): central manager workflow
-- [orchestration/router.py](src/ai_hub/orchestration/router.py): conservative route heuristic
 - [orchestration/delegation.py](src/ai_hub/orchestration/delegation.py): worker dispatch
 
 #### Schemas
@@ -356,7 +485,7 @@ If Ollama is unavailable, misconfigured, or returns an unusable plan:
 #### Memory
 
 - [memory/sqlite_db.py](src/ai_hub/memory/sqlite_db.py): SQLite persistence layer
-- [memory/store.py](src/ai_hub/memory/store.py): higher-level store API
+- [memory/store.py](src/ai_hub/memory/store.py): higher-level store API including message updates
 - [memory/history.py](src/ai_hub/memory/history.py): thread history formatting
 
 #### LLM
@@ -369,6 +498,7 @@ If Ollama is unavailable, misconfigured, or returns an unusable plan:
 
 - [tools/file_tools.py](src/ai_hub/tools/file_tools.py): workspace filesystem enforcement
 - [tools/code_runner.py](src/ai_hub/tools/code_runner.py): execution validation and sandboxed execution
+- [tools/web_search.py](src/ai_hub/tools/web_search.py): provider-backed web search and page-preview fetching
 - [tools/push_notify.py](src/ai_hub/tools/push_notify.py): web push delivery
 
 #### Web
@@ -384,6 +514,7 @@ If Ollama is unavailable, misconfigured, or returns an unusable plan:
 - [prompts/manager.txt](src/ai_hub/prompts/manager.txt)
 - [prompts/coding_agent.txt](src/ai_hub/prompts/coding_agent.txt)
 - [prompts/research_agent.txt](src/ai_hub/prompts/research_agent.txt)
+- [prompts/reviewer_agent.txt](src/ai_hub/prompts/reviewer_agent.txt)
 
 ### `scripts/`
 
@@ -435,6 +566,16 @@ Create a `.env` file with at least the relevant values for:
 - `VAPID_PRIVATE_KEY_PATH`
 - `VAPID_SUBJECT`
 - `LOG_LEVEL`
+
+Optional web-research settings:
+
+- `WEB_SEARCH_ENABLED=true`
+- `WEB_SEARCH_PROVIDER=auto|brave|tavily`
+- `BRAVE_SEARCH_API_KEY=...`
+- `TAVILY_API_KEY=...`
+- `WEB_SEARCH_MAX_RESULTS=5`
+- `WEB_SEARCH_FETCH_PAGES=true`
+- `WEB_SEARCH_FETCH_TOP_N=2`
 
 The runtime config is defined in [config.py](src/ai_hub/config.py).
 
@@ -533,11 +674,12 @@ Broad application events across:
 Manager-focused events:
 
 - Ollama planner requests/responses
+- background chat processing
 - manager routing decisions
-- `source=ollama|fallback`
+- `source=ollama|error`
 - `llm_decision`
 - `final_decision`
-- `fallback_reason`
+- planner and orchestration errors
 - approval creation
 
 #### `logs/execution.log`
@@ -569,13 +711,13 @@ If the manager behaves strangely:
 
 - inspect `logs/manager.log`
 - compare `llm_decision` vs `final_decision`
-- check `source=ollama` vs `source=fallback`
+- check `source=ollama` vs `source=error`
 
 If coding actions are wrong:
 
 - inspect `logs/execution.log`
 - look for `coding_action_batch`
-- verify `structured_plan_used`, `fallback_to_heuristic`, `action_execution_order`
+- verify `structured_plan_used` and `action_execution_order`
 
 If approval/execution fails:
 
@@ -593,7 +735,7 @@ Example:
 
 Expected behavior:
 
-- manager handles this as a direct strategic request
+- manager answers directly if the planner chooses `direct`
 - no coding workspace action is executed
 - no approval is created
 
@@ -606,7 +748,7 @@ Example:
 Expected behavior:
 
 - manager routes to coding
-- coding plan contains:
+- coding plan contains structured actions such as:
   - `make_directory demo`
   - `create_file demo/notes.txt`
 - file is created in the thread workspace
@@ -619,7 +761,7 @@ Example:
 
 Expected behavior:
 
-- coding creates a structured action batch
+- coding creates or receives a structured action batch
 - typically:
   - `make_directory src`
   - `create_file src/main.py`
@@ -641,18 +783,49 @@ Expected behavior:
 - no approval is created
 - logs show the blocked path and reason
 
+### 5. Visible LLM error in chat
+
+Example:
+
+`Was kannst du aktuell in diesem System tun?`
+
+Expected behavior when the responsible model is unavailable or returns invalid output:
+
+- the thread still receives an assistant reply
+- the reply contains an explicit error for the failing component
+- the reply includes model and error details when available
+- no silent fallback answer is generated
+
+### 6. Thinking indicator during processing
+
+Example:
+
+`Erstelle bitte ein kleines Python-Projekt mit README und requirements.txt`
+
+Expected behavior:
+
+- the user message appears immediately after pressing send
+- a pending manager message appears immediately as `Thinking`
+- animated black dots are shown while processing is still running
+- the elapsed Thinking time updates once per second
+- a short grey status line explains the current phase in compact form
+- if the page is reloaded while processing is still running, the thread still shows the same Thinking state and elapsed time
+- when the backend finishes, the pending manager message is replaced by the final answer
+- older completed Thinking blocks do not remain active in the chat UI
+
 ## Current Limitations
 
 AI Hub is useful, but not complete. Current limitations include:
 
-- The research agent is still intentionally simple and mostly analytical text output.
-- The manager can now produce structured coding plans, but fallback generation is still partly heuristic.
-- The coding agent still has a heuristic parsing fallback for cases where no structured plan is provided.
+- The system currently depends on valid LLM output for manager planning and worker reasoning.
+- If an LLM is unavailable or returns invalid output, the failure is surfaced directly in the chat instead of being auto-repaired.
+- The research and review agents are useful, but still intentionally read-only and narrow in tool use.
+- The current chat processing model uses polling from the frontend while a pending Thinking message exists.
 - The system is optimized for controlled local use, not general-purpose autonomous orchestration.
 - There is no full production deployment/ops layer yet.
 - Tailscale exposure is assumed to be host-specific and manually maintained.
 - The subprocess execution fallback is less isolated than `bubblewrap`, even though it is clearly surfaced and logged.
-- The manager uses Ollama for planning, but the quality of plans still depends on model quality and prompt adherence.
+- The quality of manager plans and worker outputs still depends strongly on model quality, prompt adherence, and the size of the selected implementation slice.
 
 ## Next Sensible Steps / Roadmap
 
@@ -664,16 +837,17 @@ The next development steps that make sense from the current state are:
 - reduce awkward or repetitive phrasing
 - keep strategic and operational responses well separated
 
-### 2. Research agent expansion
+### 2. Research and review expansion
 
-- move from placeholder analysis text to structured read-only research flows
-- define clearer source handling and result structure
+- add more explicit source handling for research work
+- define richer review contracts for implementation results
+- decide whether either read-only worker should gain bounded tool access
 
 ### 3. Stronger structured delegation
 
-- continue reducing heuristic parsing
 - let the manager produce more reliable structured coding plans
 - validate multi-step plans more strictly
+- tighten plan validation and error reporting further
 
 ### 4. Operational convenience
 
@@ -701,12 +875,14 @@ If a new Codex chat needs to understand AI Hub quickly, the best reading order i
 1. this README
 2. [workflow.py](src/ai_hub/orchestration/workflow.py)
 3. [coding_agent.py](src/ai_hub/agents/coding_agent.py)
-4. [coding_actions.py](src/ai_hub/schemas/coding_actions.py)
-5. [coding_delegation.py](src/ai_hub/schemas/coding_delegation.py)
-6. [file_tools.py](src/ai_hub/tools/file_tools.py)
-7. [code_runner.py](src/ai_hub/tools/code_runner.py)
-8. [app.py](src/ai_hub/web/app.py)
-9. [docs/logging.md](docs/logging.md)
+4. [research_agent.py](src/ai_hub/agents/research_agent.py)
+5. [reviewer_agent.py](src/ai_hub/agents/reviewer_agent.py)
+6. [coding_actions.py](src/ai_hub/schemas/coding_actions.py)
+7. [coding_delegation.py](src/ai_hub/schemas/coding_delegation.py)
+8. [file_tools.py](src/ai_hub/tools/file_tools.py)
+9. [code_runner.py](src/ai_hub/tools/code_runner.py)
+10. [app.py](src/ai_hub/web/app.py)
+11. [docs/logging.md](docs/logging.md)
 
 That path gives the fastest correct understanding of:
 
@@ -722,9 +898,11 @@ AI Hub is a private local manager-led multi-agent system with:
 - a usable web app
 - persistent chat threads
 - an Ollama-backed manager
+- dedicated coding, research, and review workers
 - structured coding delegation
 - approval-gated Python execution
 - workspace enforcement
+- visible in-chat error reporting for LLM failures
 - mobile access and push notifications
 - traceable logs
 

@@ -227,6 +227,12 @@
       border: 1px solid rgba(19, 34, 56, 0.08);
     }
 
+    .message.processing {
+      border-style: dashed;
+      border-color: rgba(19, 34, 56, 0.18);
+      background: rgba(255, 255, 255, 0.96);
+    }
+
     .message-header {
       display: flex;
       flex-direction: column;
@@ -234,6 +240,62 @@
       margin-bottom: 6px;
       font-size: 0.86rem;
       color: var(--muted);
+    }
+
+    .thinking-line {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: #111111;
+      font-weight: 600;
+    }
+
+    .thinking-dots {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      min-width: 28px;
+    }
+
+    .thinking-dots span {
+      width: 6px;
+      height: 6px;
+      border-radius: 999px;
+      background: #111111;
+      opacity: 0.25;
+      animation: thinkingBlink 1s infinite ease-in-out;
+    }
+
+    .thinking-dots span:nth-child(2) {
+      animation-delay: 0.18s;
+    }
+
+    .thinking-dots span:nth-child(3) {
+      animation-delay: 0.36s;
+    }
+
+    .thinking-time {
+      color: var(--muted);
+      font-weight: 500;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .thinking-comment {
+      margin-top: 7px;
+      color: #7b8694;
+      font-size: 0.84rem;
+      line-height: 1.35;
+    }
+
+    @keyframes thinkingBlink {
+      0%, 80%, 100% {
+        opacity: 0.25;
+        transform: translateY(0);
+      }
+      40% {
+        opacity: 1;
+        transform: translateY(-1px);
+      }
     }
 
     textarea {
@@ -503,6 +565,8 @@
     const displayModeBadge = document.getElementById("display-mode-badge");
 
     let currentThreadId = null;
+    let thinkingTimerId = null;
+    let threadPollTimerId = null;
     const query = new URLSearchParams(window.location.search);
 
     function detectStandaloneMode() {
@@ -666,24 +730,117 @@
       }
     }
 
+    function stopThinkingTimer() {
+      if (thinkingTimerId) {
+        clearInterval(thinkingTimerId);
+        thinkingTimerId = null;
+      }
+    }
+
+    function stopThreadPolling() {
+      if (threadPollTimerId) {
+        clearInterval(threadPollTimerId);
+        threadPollTimerId = null;
+      }
+    }
+
+    function formatThinkingDuration(startedAt) {
+      const elapsedSeconds = Math.max(0, Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000));
+      const minutes = Math.floor(elapsedSeconds / 60);
+      const seconds = elapsedSeconds % 60;
+      return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+    }
+
+    function isProcessingMessage(message, index, messages) {
+      return message.role === "assistant"
+        && Boolean(message.meta?.processing)
+        && index === messages.length - 1;
+    }
+
+    function updateThinkingDurations() {
+      const timers = chatLog.querySelectorAll("[data-thinking-started-at]");
+      for (const timer of timers) {
+        timer.textContent = formatThinkingDuration(timer.dataset.thinkingStartedAt);
+      }
+    }
+
+    function syncThinkingState(messages) {
+      const hasProcessing = messages.some((message, index) => isProcessingMessage(message, index, messages));
+
+      if (hasProcessing && !thinkingTimerId) {
+        updateThinkingDurations();
+        thinkingTimerId = setInterval(updateThinkingDurations, 1000);
+      }
+
+      if (!hasProcessing) {
+        stopThinkingTimer();
+      }
+
+      if (hasProcessing && currentThreadId && !threadPollTimerId) {
+        threadPollTimerId = setInterval(() => {
+          if (currentThreadId) {
+            loadThread(currentThreadId, null, { preserveStatus: true, silentPoll: true }).catch((error) => {
+              console.error(error);
+            });
+          }
+        }, 2000);
+      }
+
+      if (!hasProcessing) {
+        stopThreadPolling();
+      }
+    }
+
+    function buildThinkingBody(message) {
+      const wrapper = document.createElement("div");
+      wrapper.className = "thinking-line";
+
+      const dots = document.createElement("span");
+      dots.className = "thinking-dots";
+      dots.innerHTML = "<span></span><span></span><span></span>";
+
+      const label = document.createElement("span");
+      label.textContent = message.meta?.thinking_label || "Thinking";
+
+      const timer = document.createElement("span");
+      timer.className = "thinking-time";
+      timer.dataset.thinkingStartedAt = message.meta?.processing_started_at || message.created_at;
+      timer.textContent = formatThinkingDuration(timer.dataset.thinkingStartedAt);
+
+      wrapper.appendChild(dots);
+      wrapper.appendChild(label);
+      wrapper.appendChild(timer);
+      return wrapper;
+    }
+
     function renderMessages(messages) {
       chatLog.innerHTML = "";
 
       if (!messages.length) {
         chatLog.innerHTML = "<div class='mini'>Noch keine Nachrichten in diesem Thread.</div>";
+        syncThinkingState(messages);
         return;
       }
 
-      for (const message of messages) {
+      for (const [index, message] of messages.entries()) {
         const item = document.createElement("div");
-        item.className = `message ${message.role}`;
+        const processing = isProcessingMessage(message, index, messages);
+        item.className = `message ${message.role}${processing ? " processing" : ""}`;
 
         const header = document.createElement("div");
         header.className = "message-header";
         header.textContent = `${message.agent || message.role} · ${new Date(message.created_at).toLocaleString()}`;
 
         const body = document.createElement("div");
-        body.textContent = message.content;
+        if (processing) {
+          body.appendChild(buildThinkingBody(message));
+          const comment = document.createElement("div");
+          comment.className = "thinking-comment";
+          comment.textContent = message.meta?.processing_comment || "Manager bearbeitet die Anfrage.";
+          body.appendChild(comment);
+        } else {
+          body.textContent = message.content;
+        }
 
         item.appendChild(header);
         item.appendChild(body);
@@ -691,6 +848,7 @@
       }
 
       chatLog.scrollTop = chatLog.scrollHeight;
+      syncThinkingState(messages);
     }
 
     function approvalStatusLabel(status) {
@@ -772,7 +930,7 @@
       }
     }
 
-    async function loadThread(threadId, cachedThreads = null) {
+    async function loadThread(threadId, cachedThreads = null, options = {}) {
       const data = await fetchJson(`/api/threads/${threadId}`);
       currentThreadId = data.thread.id;
       renderMessages(data.messages);
@@ -788,10 +946,17 @@
       archiveThreadBtn.disabled = false;
       resetThreadBtn.disabled = false;
       deleteThreadBtn.disabled = false;
-      await refreshStatus();
+      if (!options.silentPoll) {
+        await refreshStatus();
+      }
+      if (!options.preserveStatus) {
+        statusEl.textContent = data.messages.some(isProcessingMessage)
+          ? "Manager denkt noch..."
+          : "Bereit.";
+      }
     }
 
-    async function createThread() {
+    async function createThread({ focus = true } = {}) {
       const data = await fetchJson("/api/threads", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -799,8 +964,29 @@
       });
 
       statusEl.textContent = "Neuer Chat erstellt.";
-      await refreshThreads(data.thread.id);
+      currentThreadId = data.thread.id;
+      threadTitleEl.textContent = data.thread.title;
+      threadMetaEl.textContent = `${data.thread.status} · 0 Nachrichten · 0 Freigaben gesamt`;
+      archiveThreadBtn.disabled = false;
+      resetThreadBtn.disabled = false;
+      deleteThreadBtn.disabled = false;
       renderMessages([]);
+      await refreshThreads(data.thread.id);
+      if (focus) {
+        messageInput.focus();
+      }
+      return data.thread;
+    }
+
+    function buildOptimisticMessage(role, content, options = {}) {
+      return {
+        id: `temp-${role}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        role,
+        agent: options.agent || (role === "assistant" ? "manager" : role),
+        content,
+        created_at: options.createdAt || new Date().toISOString(),
+        meta: options.meta || {},
+      };
     }
 
     async function sendMessage() {
@@ -812,25 +998,57 @@
       }
 
       if (!currentThreadId) {
-        await createThread();
+        await createThread({ focus: false });
       }
 
-      statusEl.textContent = "Manager bearbeitet die Nachricht...";
+      const sentAt = new Date().toISOString();
+      let baseMessages = [];
+      if (!(Array.from(chatLog.querySelectorAll(".message")).length === 0 && chatLog.textContent.includes("Noch keine Nachrichten"))) {
+        const threadData = await fetchJson(`/api/threads/${currentThreadId}`);
+        baseMessages = threadData.messages;
+      }
+      const optimisticUser = buildOptimisticMessage("user", message, { createdAt: sentAt, agent: "user" });
+      const optimisticThinking = buildOptimisticMessage("assistant", "Thinking", {
+        createdAt: sentAt,
+        agent: "manager",
+        meta: {
+          processing: true,
+          processing_started_at: sentAt,
+          thinking_label: "Thinking",
+        },
+      });
+
+      renderMessages([...baseMessages, optimisticUser, optimisticThinking]);
+
+      statusEl.textContent = "Nachricht gesendet. Manager denkt...";
       sendBtn.disabled = true;
+      messageInput.value = "";
 
       try {
-        await fetchJson("/api/chat", {
+        const data = await fetchJson("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ thread_id: currentThreadId, message }),
         });
 
-        messageInput.value = "";
-        statusEl.textContent = "Antwort erhalten.";
-        await loadThread(currentThreadId);
+        currentThreadId = data.thread.id;
+        renderMessages(data.messages);
+        threadTitleEl.textContent = data.thread.title;
+        threadMetaEl.textContent = `${data.thread.status} · ${data.messages.length} Nachrichten · 0 Freigaben gesamt`;
+        statusEl.textContent = "Nachricht aufgenommen. Manager denkt...";
+        await refreshThreads(currentThreadId);
       } catch (error) {
         console.error(error);
         statusEl.textContent = error.message || "Fehler beim Senden an das Backend.";
+        renderMessages([
+          ...baseMessages,
+          optimisticUser,
+          buildOptimisticMessage("assistant", `Fehler beim Senden:\n${error.message || "Unbekannter Fehler."}`, {
+            createdAt: new Date().toISOString(),
+            agent: "manager",
+            meta: { route: "error", manager_source: "error", final_decision: "error", processing: false },
+          }),
+        ]);
       } finally {
         sendBtn.disabled = false;
       }
@@ -860,6 +1078,8 @@
       threadTitleEl.textContent = "Noch kein Chat ausgewählt";
       threadMetaEl.textContent = "Der Manager arbeitet thread-basiert und behält Verlauf und Freigaben pro Chat.";
       chatLog.innerHTML = "<div class='mini'>Dieser Chat wurde gelöscht.</div>";
+      stopThinkingTimer();
+      stopThreadPolling();
       archiveThreadBtn.disabled = true;
       resetThreadBtn.disabled = true;
       deleteThreadBtn.disabled = true;

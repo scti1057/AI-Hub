@@ -1,33 +1,32 @@
 import json
+import hashlib
 import logging
 import re
 from pathlib import Path
+from time import monotonic
 
 from ai_hub.language_policy import LanguagePolicy
 from ai_hub.logging_config import log_event, setup_logging
 from ai_hub.llm.model_router import ModelRouter
 from ai_hub.llm.ollama_client import LLMServiceError, OllamaClient
 from ai_hub.memory.history import format_thread_history
-from ai_hub.tools.web_search import WebSearchClient, format_search_context
 
 
 logger = logging.getLogger(__name__)
 setup_logging()
 
 
-class ResearchAgent:
-    role = "research"
+class ReviewerAgent:
+    role = "review"
 
     def __init__(
         self,
         language_policy: LanguagePolicy | None = None,
         client: OllamaClient | None = None,
-        web_search: WebSearchClient | None = None,
     ) -> None:
         self.language_policy = language_policy or LanguagePolicy()
         self.client = client or OllamaClient()
-        self.web_search = web_search or WebSearchClient()
-        self.model = ModelRouter.get_model_for_role("research")
+        self.model = ModelRouter.get_model_for_role("reviewer")
         self.system_prompt = self._load_system_prompt()
 
     def handle_task(
@@ -38,37 +37,50 @@ class ResearchAgent:
         internal_task: str | None = None,
     ) -> dict:
         language_context = self.language_policy.build_context(user_task)
-        summary = format_thread_history(history, limit=4)
+        summary = format_thread_history(history, limit=6)
         worker_task = internal_task or language_context.internal_message
-        web_context = "No web search used."
-        search_payload = None
+        started = monotonic()
 
         try:
-            if self._should_use_web_search(user_task, worker_task):
-                search_query = self._build_search_query(user_task, worker_task)
-                search_payload = self.web_search.search(search_query)
-                web_context = format_search_context(search_payload)
-            prompt = self._build_prompt(
-                history_summary=summary,
-                user_task=user_task,
-                internal_task=worker_task,
-                user_language=language_context.user_language,
-                web_context=web_context,
+            prompt = self._build_prompt(summary, user_task, worker_task, language_context.user_language)
+            prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+            log_event(
+                logger,
+                "reviewer_ollama_request",
+                thread_id=thread_id,
+                model=self.model,
+                history_chars=len(summary),
+                worker_task_chars=len(worker_task),
+                prompt_chars=len(prompt),
+                prompt_digest=prompt_digest,
+                worker_task_preview=worker_task[:160],
             )
-            log_event(logger, "research_ollama_request", thread_id=thread_id, model=self.model)
             raw_response = self.client.generate(model=self.model, prompt=prompt, temperature=0.2)
             parsed = self._parse_response(raw_response)
-            reply = self._render_reply(parsed, language_context.user_language)
         except Exception as exc:
             log_event(
                 logger,
-                "research_error",
+                "reviewer_error",
                 thread_id=thread_id,
                 model=self.model,
                 error=str(exc),
+                elapsed_ms=int((monotonic() - started) * 1000),
             )
             return self._error_result(thread_id, worker_task, language_context.user_language, exc)
 
+        log_event(
+            logger,
+            "reviewer_ollama_response",
+            thread_id=thread_id,
+            model=self.model,
+            elapsed_ms=int((monotonic() - started) * 1000),
+            summary_chars=len(parsed["summary"]),
+            findings_count=len(parsed["findings"]),
+            open_questions_count=len(parsed["open_questions"]),
+            recommendation_chars=len(parsed["recommendation"]),
+        )
+
+        reply = self._render_reply(parsed, language_context.user_language)
         return {
             "status": "completed",
             "reply": reply,
@@ -78,8 +90,8 @@ class ResearchAgent:
             "internal_payload": {
                 "language": "en",
                 "thread_id": thread_id,
-                "task": f"research: {worker_task}",
-                "policy": "Research is read-only and analytical. Use English for internal coordination.",
+                "task": f"review: {worker_task}",
+                "policy": "Review is analytical and read-only. Focus on risks, gaps, and next checks.",
                 "source": "ollama",
                 "model": self.model,
                 "summary": parsed["summary"],
@@ -87,13 +99,12 @@ class ResearchAgent:
                 "assumptions": parsed["assumptions"],
                 "open_questions": parsed["open_questions"],
                 "recommendation": parsed["recommendation"],
-                "sources": self._serialize_sources(search_payload),
                 "raw_response": raw_response,
             },
         }
 
     def _load_system_prompt(self) -> str:
-        prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "research_agent.txt"
+        prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "reviewer_agent.txt"
         return prompt_path.read_text(encoding="utf-8").strip()
 
     def _build_prompt(
@@ -102,17 +113,15 @@ class ResearchAgent:
         user_task: str,
         internal_task: str,
         user_language: str,
-        web_context: str,
     ) -> str:
         return f"""
 {self.system_prompt}
 
 You are working inside a local multi-agent backend.
-You are the dedicated research worker. Stay analytical and read-only.
-If web search context is provided below, you may use it and cite those sources conservatively.
-Do not claim to have browsed the web, executed code, or changed files unless the prompt explicitly says so.
+You are the critical reviewer, not the coding or manager agent.
+Stay read-only and analytical.
 The user-facing text must be written in this language code: {user_language}.
-Internal reasoning and worker coordination stay in English.
+Internal coordination stays in English.
 
 Recent thread context:
 {history_summary}
@@ -123,73 +132,26 @@ Original user task:
 Internal worker task:
 {internal_task}
 
-Web research context:
-{web_context}
-
 Return JSON only with this shape:
 {{
-  "summary": "short analysis summary",
-  "findings": ["fact or high-confidence observation"],
-  "assumptions": ["assumption or uncertainty"],
-  "open_questions": ["question to answer next"],
+  "summary": "short review summary",
+  "findings": ["concrete risk, flaw, or concern"],
+  "assumptions": ["assumption or context gap"],
+  "open_questions": ["question to resolve next"],
   "recommendation": "best next step in the user's language",
-  "user_reply": "compact user-facing research answer in the user's language"
+  "user_reply": "compact user-facing review reply in the user's language"
 }}
 """.strip()
-
-    def _should_use_web_search(self, user_task: str, worker_task: str) -> bool:
-        if not self.web_search.is_available():
-            return False
-        combined = f"{user_task}\n{worker_task}".lower()
-        indicators = (
-            "web",
-            "internet",
-            "latest",
-            "aktuell",
-            "heute",
-            "today",
-            "dokumentation",
-            "documentation",
-            "docs",
-            "library",
-            "framework",
-            "api",
-            "search",
-            "recherche",
-            "research",
-            "compare",
-            "vergleich",
-        )
-        return any(indicator in combined for indicator in indicators)
-
-    def _build_search_query(self, user_task: str, worker_task: str) -> str:
-        preferred = worker_task.strip() or user_task.strip()
-        preferred = re.sub(r"\s+", " ", preferred).strip()
-        return preferred[:240]
-
-    def _serialize_sources(self, search_payload: dict | None) -> list[dict]:
-        if not search_payload:
-            return []
-        serialized = []
-        for item in search_payload.get("results") or []:
-            serialized.append(
-                {
-                    "title": item.get("title", ""),
-                    "url": item.get("url", ""),
-                    "source": item.get("source", ""),
-                }
-            )
-        return serialized[:6]
 
     def _parse_response(self, response: str) -> dict:
         json_match = re.search(r"\{.*\}", response, flags=re.DOTALL)
         if not json_match:
-            raise ValueError("Research agent did not return JSON.")
+            raise ValueError("Reviewer agent did not return JSON.")
         payload = json.loads(json_match.group(0))
         summary = str(payload.get("summary", "")).strip()
         user_reply = str(payload.get("user_reply", "")).strip()
         if not summary or not user_reply:
-            raise ValueError("Research agent response is missing required fields.")
+            raise ValueError("Reviewer agent response is missing required fields.")
         return {
             "summary": summary,
             "findings": self._normalize_list(payload.get("findings")),
@@ -202,20 +164,15 @@ Return JSON only with this shape:
     def _normalize_list(self, value: object) -> list[str]:
         if not isinstance(value, list):
             return []
-        normalized: list[str] = []
-        for item in value:
-            text = str(item).strip()
-            if text:
-                normalized.append(text)
-        return normalized[:6]
+        return [text for item in value if (text := str(item).strip())][:6]
 
     def _error_result(self, thread_id: str, worker_task: str, user_language: str, exc: Exception) -> dict:
-        code = getattr(exc, "code", "research_llm_error")
+        code = getattr(exc, "code", "reviewer_llm_error")
         status_code = getattr(exc, "status_code", None)
         details = str(exc).strip() or code
         if user_language == "de":
             reply = (
-                "Research-Agent Fehler:\n"
+                "Kritiker-Agent Fehler:\n"
                 f"- Modell: `{self.model}`\n"
                 f"- Fehlercode: `{code}`\n"
                 f"- Details: {details}"
@@ -224,7 +181,7 @@ Return JSON only with this shape:
                 reply += f"\n- HTTP-Status: `{status_code}`"
         else:
             reply = (
-                "Research agent error:\n"
+                "Reviewer agent error:\n"
                 f"- Model: `{self.model}`\n"
                 f"- Error code: `{code}`\n"
                 f"- Details: {details}"
@@ -236,12 +193,12 @@ Return JSON only with this shape:
             "reply": reply,
             "user_reply": reply,
             "tool_results": [],
-            "internal_summary": f"Research agent failed with {code}.",
+            "internal_summary": f"Reviewer agent failed with {code}.",
             "internal_payload": {
                 "language": "en",
                 "thread_id": thread_id,
-                "task": f"research: {worker_task}",
-                "policy": "Research is read-only and analytical. Use English for internal coordination.",
+                "task": f"review: {worker_task}",
+                "policy": "Review is analytical and read-only. Focus on risks, gaps, and next checks.",
                 "source": "error",
                 "model": self.model,
                 "error": {
@@ -255,28 +212,20 @@ Return JSON only with this shape:
         }
 
     def _render_reply(self, payload: dict, user_language: str) -> str:
-        findings = payload.get("findings") or []
-        assumptions = payload.get("assumptions") or []
-        open_questions = payload.get("open_questions") or []
-        recommendation = payload.get("recommendation", "").strip()
-        user_reply = payload["user_reply"].strip()
-
-        sections = [user_reply]
-        if findings:
-            label = "Kernpunkte" if user_language == "de" else "Key findings"
-            sections.append(self._format_bullets(label, findings))
-        if assumptions:
-            label = "Annahmen" if user_language == "de" else "Assumptions"
-            sections.append(self._format_bullets(label, assumptions))
-        if open_questions:
-            label = "Offene Fragen" if user_language == "de" else "Open questions"
-            sections.append(self._format_bullets(label, open_questions))
-        if recommendation:
+        sections = [payload["user_reply"].strip()]
+        if payload["findings"]:
+            title = "Kritische Punkte" if user_language == "de" else "Findings"
+            sections.append(self._format_bullets(title, payload["findings"]))
+        if payload["assumptions"]:
+            title = "Annahmen" if user_language == "de" else "Assumptions"
+            sections.append(self._format_bullets(title, payload["assumptions"]))
+        if payload["open_questions"]:
+            title = "Offene Fragen" if user_language == "de" else "Open questions"
+            sections.append(self._format_bullets(title, payload["open_questions"]))
+        if payload["recommendation"]:
             prefix = "Empfehlung" if user_language == "de" else "Recommendation"
-            sections.append(f"{prefix}: {recommendation}")
+            sections.append(f"{prefix}: {payload['recommendation']}")
         return "\n\n".join(section for section in sections if section.strip())
 
     def _format_bullets(self, title: str, items: list[str]) -> str:
-        lines = [f"{title}:"]
-        lines.extend(f"- {item}" for item in items[:4])
-        return "\n".join(lines)
+        return "\n".join([f"{title}:"] + [f"- {item}" for item in items[:4]])

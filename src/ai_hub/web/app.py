@@ -1,6 +1,7 @@
 from pathlib import Path
 import logging
 import secrets
+import threading
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -71,6 +72,27 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 init_db()
 store = HubStore()
 workflow = ManagerWorkflow(store=store)
+
+
+def _run_chat_in_background(thread_id: str, user_message: str, pending_message_id: int, request_id: str) -> None:
+    token = set_request_id(request_id)
+    try:
+        workflow.process_enqueued_chat(
+            thread_id=thread_id,
+            user_message=user_message,
+            pending_message_id=pending_message_id,
+        )
+    except Exception as exc:
+        log_event(
+            logger,
+            "api_chat_background_failed",
+            thread_id=thread_id,
+            pending_message_id=pending_message_id,
+            error=str(exc),
+            exception_type=type(exc).__name__,
+        )
+    finally:
+        reset_request_id(token)
 
 
 @app.middleware("http")
@@ -244,7 +266,7 @@ def create_thread(payload: ThreadCreateRequest, request: Request):
 
     thread = store.ensure_thread(None, title=payload.title or "Neuer Chat")
     log_event(logger, "api_thread_created", thread_id=thread["id"], title=thread["title"])
-    return {"thread": thread, "messages": []}
+    return {"thread": thread, "messages": [], "artifacts": []}
 
 
 @app.get("/api/threads/{thread_id}")
@@ -262,6 +284,7 @@ def get_thread(thread_id: str, request: Request):
         "thread": thread,
         "messages": store.list_messages(thread_id),
         "approvals": store.list_approvals(thread_id=thread_id),
+        "artifacts": store.list_artifacts(thread_id),
     }
 
 
@@ -288,7 +311,12 @@ def reset_thread(thread_id: str, request: Request):
         log_event(logger, "api_thread_reset_missing", thread_id=thread_id)
         return JSONResponse({"message": "Thread nicht gefunden."}, status_code=404)
     log_event(logger, "api_thread_reset", thread_id=thread_id)
-    return {"thread": thread, "messages": [], "approvals": store.list_approvals(thread_id=thread_id)}
+    return {
+        "thread": thread,
+        "messages": [],
+        "approvals": store.list_approvals(thread_id=thread_id),
+        "artifacts": store.list_artifacts(thread_id),
+    }
 
 
 @app.delete("/api/threads/{thread_id}")
@@ -363,7 +391,37 @@ def chat(payload: ChatRequest, request: Request):
         return {"reply": "Bitte sende eine nicht-leere Nachricht."}
 
     try:
-        result = workflow.handle_chat(thread_id=payload.thread_id, user_message=user_message)
+        thread = store.ensure_thread(payload.thread_id)
+        user_entry = store.add_message(thread["id"], role="user", content=user_message)
+        store.rename_thread_from_first_message(thread["id"], user_message)
+        pending_message = store.add_message(
+            thread["id"],
+            role="assistant",
+            content="Thinking",
+            agent="manager",
+            meta={
+                "route": "pending",
+                "manager_source": "pending",
+                "final_decision": "pending",
+                "processing": True,
+                "processing_started_at": user_entry["created_at"],
+                "thinking_label": "Thinking",
+            },
+        )
+        background_thread = threading.Thread(
+            target=_run_chat_in_background,
+            args=(thread["id"], user_message, pending_message["id"], getattr(request.state, "request_id", uuid4().hex[:12])),
+            daemon=True,
+        )
+        background_thread.start()
+        result = {
+            "thread": store.get_thread(thread["id"]),
+            "message": pending_message,
+            "reply": pending_message["content"],
+            "route": "pending",
+            "approval_request": None,
+            "messages": store.list_messages(thread["id"]),
+        }
     except (WorkspaceSecurityError, ExecutionPolicyError) as exc:
         log_event(logger, "api_chat_blocked", thread_id=payload.thread_id, error_code=getattr(exc, "code", "request_blocked"))
         return JSONResponse(
@@ -378,9 +436,9 @@ def chat(payload: ChatRequest, request: Request):
         return JSONResponse({"message": str(exc)}, status_code=400)
     log_event(
         logger,
-        "api_chat_completed",
+        "api_chat_queued",
         thread_id=result["thread"]["id"],
         route=result["route"],
-        approval_created=bool(result["approval_request"]),
+        approval_created=False,
     )
     return result
