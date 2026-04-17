@@ -59,7 +59,7 @@ def test_reviewer_agent_uses_reviewer_model(monkeypatch, tmp_path):
     )
 
     assert result["status"] == "completed"
-    assert client.calls[0]["model"] == "deepseek-r1:32b-qwen-distill-q4_K_M"
+    assert client.calls[0]["model"] == "qwen3-coder:30b"
     assert "Kritische Punkte:" in result["reply"]
     assert result["internal_payload"]["task"].startswith("review:")
 

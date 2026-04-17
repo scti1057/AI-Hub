@@ -146,6 +146,34 @@ def test_coding_agent_executes_llm_planned_actions(monkeypatch, tmp_path):
     assert result["internal_payload"]["self_check"]["inspected_files"][0]["path"] == "demo/from_llm.txt"
 
 
+def test_coding_agent_uses_internal_task_for_llm_planning(monkeypatch, tmp_path):
+    configure_workspace(monkeypatch, tmp_path)
+
+    from ai_hub.agents.coding_agent import CodingAgent
+
+    client = FakeCodingClient(
+        """
+        {
+          "actions": [
+            {"action_type": "create_file", "path": "src/main.py", "content": "print('from step')\\n", "content_inferred": false}
+          ]
+        }
+        """
+    )
+
+    agent = CodingAgent(client=client)
+    result = agent.handle_task(
+        thread_id="thread-internal-task",
+        user_task="Please build the whole project.",
+        history=[],
+        internal_task="Current step: create src/main.py and nothing else.",
+    )
+
+    assert result["status"] == "completed"
+    assert "Current step: create src/main.py and nothing else." in client.calls[0]["prompt"]
+    assert "Please build the whole project." in client.calls[0]["prompt"]
+
+
 def test_coding_agent_self_check_flags_missing_runtime_validation(monkeypatch, tmp_path):
     configure_workspace(monkeypatch, tmp_path)
 
@@ -172,3 +200,135 @@ def test_coding_agent_self_check_flags_missing_runtime_validation(monkeypatch, t
     assert result["status"] == "completed"
     assert self_check["inspected_files"][0]["path"] == "app/main.py"
     assert any("runtime validation" in item.lower() for item in self_check["follow_up"])
+
+
+def test_coding_agent_keeps_explicit_missing_read_blocked(monkeypatch, tmp_path):
+    configure_workspace(monkeypatch, tmp_path)
+
+    from ai_hub.agents.coding_agent import CodingAgent
+    from ai_hub.schemas.coding_actions import CodingActionBatch, ReadFileAction
+
+    agent = CodingAgent()
+    result = agent.handle_task(
+        thread_id="thread-explicit-missing-read",
+        user_task="Please inspect src/main.py",
+        history=[],
+        structured_plan=CodingActionBatch(actions=[ReadFileAction(path="src/main.py")]),
+    )
+
+    assert result["status"] == "blocked"
+    assert "Not found" in result["reply"] or "Nicht gefunden" in result["reply"]
+
+
+def test_coding_agent_skips_missing_integration_read_inside_mutating_batch(monkeypatch, tmp_path):
+    file_tools = configure_workspace(monkeypatch, tmp_path)
+
+    from ai_hub.agents.coding_agent import CodingAgent
+    from ai_hub.schemas.coding_actions import CodingActionBatch, CreateFileAction, ReadFileAction
+
+    file_tools.write_file("thread-skip-read", "src/game_engine.py", "class Engine:\n    pass\n")
+    agent = CodingAgent()
+    result = agent.handle_task(
+        thread_id="thread-skip-read",
+        user_task="Implement the next bounded UI step.",
+        history=[],
+        structured_plan=CodingActionBatch(
+            actions=[
+                CreateFileAction(path="src/gui_components.py", content="print('ui')\n", content_inferred=False),
+                ReadFileAction(path="src/main.py"),
+                ReadFileAction(path="src/game_engine.py"),
+            ]
+        ),
+    )
+
+    assert result["status"] == "completed"
+    assert any(item.get("target") == "src/main.py" and item["action_type"] == "read_file" for item in result["actions_executed"])
+    skipped_entry = next(item for item in result["actions_executed"] if item.get("target") == "src/main.py")
+    assert skipped_entry["details"]["skipped"] is True
+    assert "Skipped read" in result["reply"] or "Lesen übersprungen" in result["reply"]
+
+
+def test_coding_agent_normalizes_pytest_command_string_request(monkeypatch, tmp_path):
+    file_tools = configure_workspace(monkeypatch, tmp_path)
+
+    from ai_hub.agents.coding_agent import CodingAgent
+    from ai_hub.schemas.coding_actions import CodingActionBatch, RequestExecutionAction
+
+    file_tools.write_file("thread-pytest-command", "tests/test_game_engine.py", "def test_ok():\n    assert True\n")
+    agent = CodingAgent()
+    result = agent.handle_task(
+        thread_id="thread-pytest-command",
+        user_task="Run the test file.",
+        history=[],
+        structured_plan=CodingActionBatch(
+            actions=[RequestExecutionAction(target="python -m pytest tests/test_game_engine.py -v")]
+        ),
+    )
+
+    assert result["status"] == "approval_required"
+    approval = result["approval_request"]
+    assert approval is not None
+    assert approval["command"]["argv"] == ["-m", "pytest", "tests/test_game_engine.py", "-v"]
+    assert approval["command"]["preview"] == "python -m pytest tests/test_game_engine.py -v"
+
+
+def test_coding_agent_normalizes_workspace_test_file_to_pytest(monkeypatch, tmp_path):
+    file_tools = configure_workspace(monkeypatch, tmp_path)
+
+    from ai_hub.agents.coding_agent import CodingAgent
+    from ai_hub.schemas.coding_actions import CodingActionBatch, RequestExecutionAction
+
+    file_tools.write_file("thread-test-file-run", "tests/test_game_engine.py", "def test_ok():\n    assert True\n")
+    agent = CodingAgent()
+    result = agent.handle_task(
+        thread_id="thread-test-file-run",
+        user_task="Run the unit test file.",
+        history=[],
+        structured_plan=CodingActionBatch(
+            actions=[RequestExecutionAction(target="tests/test_game_engine.py")]
+        ),
+    )
+
+    assert result["status"] == "approval_required"
+    approval = result["approval_request"]
+    assert approval is not None
+    assert approval["command"]["argv"] == ["-m", "pytest", "tests/test_game_engine.py", "-v"]
+    assert approval["command"]["preview"] == "python -m pytest tests/test_game_engine.py -v"
+
+
+def test_dependency_analysis_ignores_stdlib_and_local_modules(monkeypatch, tmp_path):
+    file_tools = configure_workspace(monkeypatch, tmp_path)
+
+    from ai_hub.tools.dependency_tools import analyze_workspace_dependencies
+
+    file_tools.write_file(
+        "thread-dependency-audit",
+        "src/main.py",
+        "import tkinter\nimport requests\nfrom app import helper\n",
+    )
+    file_tools.write_file("thread-dependency-audit", "src/app/__init__.py", "")
+    file_tools.write_file("thread-dependency-audit", "src/app/helper.py", "VALUE = 1\n")
+
+    result = analyze_workspace_dependencies("thread-dependency-audit")
+
+    assert "requests" in result["missing_requirements"]
+    assert "tkinter" not in result["missing_requirements"]
+    assert "app" not in result["missing_requirements"]
+
+
+def test_dependency_analysis_ignores_src_layout_package_root(monkeypatch, tmp_path):
+    file_tools = configure_workspace(monkeypatch, tmp_path)
+
+    from ai_hub.tools.dependency_tools import analyze_workspace_dependencies
+
+    file_tools.write_file(
+        "thread-src-layout",
+        "src/main.py",
+        "from src.constants import VALUE\n",
+    )
+    file_tools.write_file("thread-src-layout", "src/constants.py", "VALUE = 1\n")
+
+    result = analyze_workspace_dependencies("thread-src-layout")
+
+    assert "src" not in result["missing_requirements"]
+    assert result["packages_to_install"] == []

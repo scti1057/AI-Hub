@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import shlex
 from pathlib import Path
 
 from ai_hub.language_policy import LanguagePolicy
@@ -76,6 +77,7 @@ class CodingAgent:
         try:
             action_batch, structured_plan_used, fallback_to_heuristic, plan_validation_success = self._resolve_action_batch(
                 user_task,
+                internal_task,
                 structured_plan,
             )
         except Exception as exc:
@@ -148,9 +150,22 @@ class CodingAgent:
         approval_request: dict | None = None
         execution_order: list[str] = []
 
-        for action in action_batch.actions:
+        for index, action in enumerate(action_batch.actions):
             execution_order.append(action.action_type)
-            result = self._execute_action(thread_id, action, user_language)
+            if isinstance(action, ReadFileAction):
+                skipped_read = self._maybe_skip_missing_read(
+                    thread_id=thread_id,
+                    action=action,
+                    user_language=user_language,
+                    executed=executed,
+                    remaining_actions=action_batch.actions[index + 1:],
+                )
+                if skipped_read is not None:
+                    result = skipped_read
+                else:
+                    result = self._execute_action(thread_id, action, user_language)
+            else:
+                result = self._execute_action(thread_id, action, user_language)
             log_event(
                 logger,
                 "coding_action_result",
@@ -177,6 +192,56 @@ class CodingAgent:
             "blocked": blocked,
             "approval_request": approval_request,
         }
+
+    def _maybe_skip_missing_read(
+        self,
+        *,
+        thread_id: str,
+        action: ReadFileAction,
+        user_language: str,
+        executed: list[CodingActionResult],
+        remaining_actions: list[CodingAction],
+    ) -> CodingActionResult | None:
+        try:
+            target_path = file_tools.resolve_workspace_path(thread_id, action.path)
+        except file_tools.WorkspaceSecurityError:
+            return None
+
+        if target_path.exists():
+            return None
+
+        batch_contains_mutation = any(
+            item.action_type in {"make_directory", "create_file", "delete_path"}
+            for item in remaining_actions
+        ) or any(
+            result.action_type in {"make_directory", "create_file", "delete_path"}
+            for result in executed
+        )
+        if not batch_contains_mutation:
+            return None
+
+        log_event(
+            logger,
+            "coding_read_deferred",
+            thread_id=thread_id,
+            path=action.path,
+            reason="workspace_file_not_found_deferred",
+        )
+        return CodingActionResult(
+            action_type=action.action_type,
+            target=action.path,
+            status="completed",
+            message=self.language_policy.user_text(
+                user_language,
+                f"Lesen übersprungen: `{action.path}` existiert in diesem Schritt noch nicht und wird später integriert.",
+                f"Skipped read: `{action.path}` does not exist yet in this step and will be integrated later.",
+            ),
+            details={
+                "path": action.path,
+                "skipped": True,
+                "code": "workspace_file_not_found_deferred",
+            },
+        )
 
     def _execute_action(
         self,
@@ -476,15 +541,7 @@ class CodingAgent:
         action: RequestExecutionAction,
         user_language: str,
     ) -> dict:
-        lowered_target = action.target.lower()
-        pytest_match = lowered_target.endswith(".py") is False and action.target == "pytest"
-
-        if pytest_match:
-            argv = ["-m", "pytest"]
-            rationale = "The coding agent wants to run an allowed Python test command inside the sandbox workspace."
-        else:
-            argv = [action.target]
-            rationale = "The coding agent wants to execute a Python file inside the sandbox workspace."
+        argv, rationale = self._normalize_execution_target(action.target)
 
         command = code_runner.build_python_execution_request(
             thread_id=thread_id,
@@ -508,6 +565,67 @@ class CodingAgent:
                 f"Approval required: `{command['preview']}` has been prepared as an execution request.",
             ),
         }
+
+    def _normalize_execution_target(self, target: str) -> tuple[list[str], str]:
+        cleaned_target = str(target or "").strip()
+        if not cleaned_target:
+            raise code_runner.ExecutionPolicyError(
+                "Leerer Ausführungspfad ist nicht erlaubt.",
+                code="execution_empty_command",
+            )
+
+        try:
+            tokens = shlex.split(cleaned_target)
+        except ValueError:
+            tokens = cleaned_target.split()
+        if not tokens:
+            raise code_runner.ExecutionPolicyError(
+                "Leerer Ausführungspfad ist nicht erlaubt.",
+                code="execution_empty_command",
+            )
+
+        if tokens[0] in {"python", "python3"}:
+            tokens = tokens[1:]
+        if not tokens:
+            raise code_runner.ExecutionPolicyError(
+                "Leerer Python-Befehl ist nicht erlaubt.",
+                code="execution_empty_command",
+            )
+
+        if tokens[0] in {"pytest", "unittest"}:
+            module = tokens[0]
+            argv = ["-m", module, *tokens[1:]]
+            rationale = "The coding agent wants to run an allowed Python test command inside the sandbox workspace."
+            return argv, rationale
+
+        if tokens[0] == "-m" and len(tokens) >= 2 and tokens[1] in {"pytest", "unittest"}:
+            rationale = "The coding agent wants to run an allowed Python test command inside the sandbox workspace."
+            return tokens, rationale
+
+        normalized_test_file = self._normalize_workspace_test_file_execution(tokens)
+        if normalized_test_file is not None:
+            rationale = "The coding agent wants to run a workspace test file through pytest inside the sandbox workspace."
+            return normalized_test_file, rationale
+
+        rationale = "The coding agent wants to execute a Python file inside the sandbox workspace."
+        return tokens, rationale
+
+    def _normalize_workspace_test_file_execution(self, tokens: list[str]) -> list[str] | None:
+        if not tokens:
+            return None
+
+        candidate = str(tokens[0]).strip()
+        if not candidate.endswith(".py"):
+            return None
+
+        normalized = candidate.replace("\\", "/")
+        if not normalized.startswith("tests/"):
+            return None
+
+        extra_args = list(tokens[1:])
+        if "-v" not in extra_args:
+            extra_args.append("-v")
+        return ["-m", "pytest", candidate, *extra_args]
 
     def _build_internal_payload(self, internal_task: str, thread_id: str, self_check: dict | None = None) -> dict:
         return {
@@ -599,6 +717,7 @@ class CodingAgent:
     def _resolve_action_batch(
         self,
         user_task: str,
+        internal_task: str,
         structured_plan: CodingDelegationPlan | CodingActionBatch | None,
     ) -> tuple[CodingActionBatch, bool, bool, bool]:
         if isinstance(structured_plan, CodingDelegationPlan):
@@ -610,7 +729,7 @@ class CodingAgent:
             if structured_plan.actions:
                 return structured_plan, True, False, True
             raise ValueError("Structured coding action batch is empty.")
-        llm_batch = self.build_action_batch_from_llm(user_task)
+        llm_batch = self.build_action_batch_from_llm(user_task, internal_task=internal_task)
         if llm_batch is None or not llm_batch.actions:
             raise ValueError("Coding agent returned no executable actions.")
         return llm_batch, True, False, True
@@ -626,9 +745,11 @@ class CodingAgent:
 You are working inside a local multi-agent backend with strict server-side safety controls.
 Translate the request into a conservative structured coding action batch.
 Only use supported action types and only return actions that fit the user's request.
-If the internal task already defines a bounded implementation slice, you may write meaningful starter code and tests that fit that slice.
+If the internal task already defines a bounded implementation step, you may write meaningful starter code and tests that fit that step.
 Do not return placeholder-only files when the request clearly expects real implementation progress.
 Only leave file content empty when the file is intentionally empty, such as a package marker file.
+Only use `read_file` for files that already exist or that the user explicitly asked to inspect.
+Do not plan reads for future integration files that have not been created yet.
 Never return absolute paths or parent-directory escapes.
 If no safe coding action is clear, return an empty action list.
 

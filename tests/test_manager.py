@@ -204,6 +204,66 @@ def test_manager_creates_pending_approval_for_python_execution(monkeypatch, tmp_
     assert approval["tool_name"] == "request_python_execution"
 
 
+def test_code_runner_accepts_pytest_flags_and_workspace_test_paths(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.tools import file_tools
+    from ai_hub.tools.code_runner import build_python_execution_request, validate_python_execution_request
+
+    thread_id = "thread-pytest-flags"
+    file_tools.write_file(thread_id, "tests/test_game_engine.py", "def test_ok():\n    assert True\n")
+
+    command = build_python_execution_request(
+        thread_id=thread_id,
+        argv=["-m", "pytest", "tests/test_game_engine.py", "-v"],
+        rationale="Run pytest for one workspace test file.",
+    )
+    details = validate_python_execution_request(command)
+
+    assert details["argv"] == ["-m", "pytest", "tests/test_game_engine.py", "-v"]
+
+
+def test_workspace_venv_bootstraps_pip_when_missing(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    import ai_hub.tools.code_runner as code_runner
+
+    workspace = tmp_path / "workspaces" / "thread-pip-bootstrap"
+    venv_path = workspace / ".venv"
+    python_path = venv_path / "bin" / "python"
+    python_path.parent.mkdir(parents=True, exist_ok=True)
+    python_path.write_text("", encoding="utf-8")
+
+    calls: list[list[str]] = []
+
+    class Completed:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if list(cmd[1:4]) == ["-m", "pip", "--version"]:
+            if sum(1 for call in calls if call[1:4] == ["-m", "pip", "--version"]) == 1:
+                return Completed(1, stderr="No module named pip")
+            return Completed(0, stdout="pip 25.0")
+        if list(cmd[1:4]) == ["-m", "ensurepip", "--upgrade"]:
+            return Completed(0, stdout="installed")
+        raise AssertionError(f"Unexpected command: {cmd}")
+
+    monkeypatch.setattr(code_runner.subprocess, "run", fake_run)
+
+    result = code_runner._ensure_workspace_venv(venv_path)
+
+    assert result == python_path.resolve()
+    assert [call[1:4] for call in calls] == [
+        ["-m", "pip", "--version"],
+        ["-m", "ensurepip", "--upgrade"],
+        ["-m", "pip", "--version"],
+    ]
+
+
 def test_manager_executes_allowed_workspace_write(monkeypatch, tmp_path):
     configure_paths(monkeypatch, tmp_path)
 
@@ -246,6 +306,58 @@ def test_manager_can_create_python_file_and_request_execution(monkeypatch, tmp_p
     assert "Freigabe nötig:" in result["reply"]
     assert result["approval_request"] is not None
     assert 'print("Hello World")' in read_file(thread_id, "hello.py")
+
+
+def test_manager_requests_dependency_install_for_missing_workspace_package(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+    from ai_hub.tools.file_tools import write_file
+
+    store = HubStore()
+    workflow = ManagerWorkflow(store=store, planner=DeterministicPlanner())
+    thread = store.ensure_thread(None)
+
+    write_file(thread["id"], "src/main.py", "import requests\n")
+    workflow.delegation.coding_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "File created: `src/main.py`.",
+            "user_reply": "File created: `src/main.py`.",
+            "internal_summary": "Executed actions: create_file. Blocked actions: none. Approval request created: no.",
+            "actions_executed": [{"action_type": "create_file", "target": "src/main.py"}],
+            "actions_blocked": [],
+            "workspace": str(tmp_path / "workspaces" / thread["id"]),
+            "internal_payload": {
+                "language": "en",
+                "thread_id": thread["id"],
+                "task": "Create src/main.py.",
+                "self_check": {
+                    "inspected_files": [],
+                    "touched_paths": ["src/main.py"],
+                    "follow_up": [],
+                    "summary": "Inspected files after execution: src/main.py.",
+                },
+            },
+        }
+    )
+
+    result = workflow.handle_chat(
+        thread_id=thread["id"],
+        user_message="Please create src/main.py",
+    )
+
+    approval = result["approval_request"]
+    assert approval is not None
+    assert approval["tool_name"] == "install_python_requirements"
+    assert approval["command"]["kind"] == "pip_install"
+    assert "requests" in approval["command"]["packages"]
+    assert "requirements.txt" in result["reply"]
+
+    dependency_status = store.get_artifact(thread["id"], "dependency_status")
+    assert dependency_status is not None
+    assert "requests" in dependency_status["content"]["missing_requirements"]
 
 
 def test_manager_creates_nested_directory_and_file(monkeypatch, tmp_path):
@@ -600,10 +712,671 @@ def test_manager_resumes_project_from_user_feedback(monkeypatch, tmp_path):
     assert plan_result["route"] == "plan"
     assert follow_up["route"] == "coding"
     assert len(coding_worker.calls) == 1
+    assert len(research_worker.calls) == 1
+    assert len(review_worker.calls) == 2
     assert "Continue the active project" in coding_worker.calls[0]["internal_task"]
     artifacts = {artifact["kind"]: artifact for artifact in store.list_artifacts(plan_result["thread"]["id"])}
     assert artifacts["project_state"]["content"]["phase"] == "implementation"
 
+
+def test_manager_runs_multiple_autonomous_project_steps_in_one_turn(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+    from ai_hub.schemas.coding_actions import CodingActionBatch, CreateFileAction
+    from ai_hub.schemas.coding_delegation import CodingDelegationPlan
+    from ai_hub.schemas.manager_plan import ManagerPlan, ProjectOutline
+
+    class AutonomousPlanner:
+        def plan(self, history_text: str, user_message: str, user_language: str):
+            return {
+                "enabled": True,
+                "source": "ollama",
+                "plan": ManagerPlan(
+                    summary="Build the requested project in small steps.",
+                    decision="coding",
+                    reason="A bounded autonomous project run is appropriate.",
+                    user_reply="I will implement the project in small steps and stop when it is ready to test or needs approval.",
+                    internal_task_for_worker="Build the requested project with a clean repository structure.",
+                    approval_needed=False,
+                    coding_plan=CodingDelegationPlan(
+                        summary="Create the first repository file.",
+                        rationale="The first step creates real structure before follow-up steps continue.",
+                        approval_needed=False,
+                        actions=CodingActionBatch(
+                            actions=[
+                                CreateFileAction(
+                                    path="src/game_logic.py",
+                                    content="def winner(board):\n    return None\n",
+                                    content_inferred=False,
+                                )
+                            ]
+                        ),
+                    ),
+                    project_outline=ProjectOutline(
+                        summary="Tic-tac-toe should be built as a small repository with a smoke-test step.",
+                        repo_structure=[
+                            "src/game_logic.py - core rules",
+                            "src/main.py - entry point",
+                        ],
+                        steps=[
+                            "Create the repository scaffold and the core game logic module.",
+                            "Wire the main entry point to the game logic.",
+                        ],
+                        validation_steps=[
+                            "Request one smoke test execution for src/main.py.",
+                        ],
+                        completion_criteria=[
+                            "The project can be started from src/main.py without obvious import errors.",
+                            "The first playable scenario is ready to test.",
+                        ],
+                        autonomous_execution=True,
+                    ),
+                ),
+            }
+
+    class SequentialCodingWorker:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+            self.results = [
+                {
+                    "status": "completed",
+                    "reply": "File created: `src/game_logic.py`.",
+                    "user_reply": "File created: `src/game_logic.py`.",
+                    "internal_summary": "Executed actions: create_file. Blocked actions: none. Approval request created: no. Self-check: Inspected files after execution: src/game_logic.py.",
+                    "actions_executed": [{"action_type": "create_file", "target": "src/game_logic.py"}],
+                    "actions_blocked": [],
+                    "workspace": str(tmp_path / "workspaces" / "thread"),
+                    "internal_payload": {
+                        "language": "en",
+                        "thread_id": "ignored",
+                        "task": "step 1",
+                        "self_check": {
+                            "inspected_files": [{"path": "src/game_logic.py", "preview": "def winner(board):\n    return None\n", "bytes": 35}],
+                            "touched_paths": ["src/game_logic.py"],
+                            "follow_up": [],
+                            "summary": "Inspected files after execution: src/game_logic.py.",
+                        },
+                    },
+                },
+                {
+                    "status": "completed",
+                    "reply": "File created: `src/main.py`.",
+                    "user_reply": "File created: `src/main.py`.",
+                    "internal_summary": "Executed actions: create_file. Blocked actions: none. Approval request created: no. Self-check: Inspected files after execution: src/main.py.",
+                    "actions_executed": [{"action_type": "create_file", "target": "src/main.py"}],
+                    "actions_blocked": [],
+                    "workspace": str(tmp_path / "workspaces" / "thread"),
+                    "internal_payload": {
+                        "language": "en",
+                        "thread_id": "ignored",
+                        "task": "step 2",
+                        "self_check": {
+                            "inspected_files": [{"path": "src/main.py", "preview": "from game_logic import winner\nprint('ready')\n", "bytes": 41}],
+                            "touched_paths": ["src/main.py"],
+                            "follow_up": [],
+                            "summary": "Inspected files after execution: src/main.py.",
+                        },
+                    },
+                },
+                {
+                    "status": "completed_with_approval",
+                    "reply": "Approval required: `python src/main.py` has been prepared as an execution request.",
+                    "user_reply": "Approval required: `python src/main.py` has been prepared as an execution request.",
+                    "internal_summary": "Executed actions: request_execution. Blocked actions: none. Approval request created: yes. Self-check: Follow-up: Runtime validation is still pending user approval.",
+                    "actions_executed": [{"action_type": "request_execution", "target": "src/main.py"}],
+                    "actions_blocked": [],
+                    "workspace": str(tmp_path / "workspaces" / "thread"),
+                    "approval_request": {
+                        "tool_name": "request_python_execution",
+                        "command": {
+                            "thread_id": "thread-autonomous",
+                            "argv": ["src/main.py"],
+                            "preview": "python src/main.py",
+                            "rationale": "Smoke test the entry point.",
+                        },
+                        "rationale": "Smoke test the entry point.",
+                    },
+                    "internal_payload": {
+                        "language": "en",
+                        "thread_id": "ignored",
+                        "task": "validation",
+                        "self_check": {
+                            "inspected_files": [{"path": "src/main.py", "preview": "from game_logic import winner\nprint('ready')\n", "bytes": 41}],
+                            "touched_paths": ["src/main.py"],
+                            "follow_up": ["Runtime validation is still pending user approval."],
+                            "summary": "Follow-up: Runtime validation is still pending user approval.",
+                        },
+                    },
+                },
+            ]
+
+        def handle_task(self, thread_id: str, user_task: str, history: list[dict], internal_task: str | None = None, structured_plan=None) -> dict:
+            self.calls.append(
+                {
+                    "thread_id": thread_id,
+                    "user_task": user_task,
+                    "history": history,
+                    "internal_task": internal_task,
+                    "structured_plan": structured_plan,
+                }
+            )
+            return dict(self.results[len(self.calls) - 1])
+
+    store = HubStore()
+    workflow = ManagerWorkflow(store=store, planner=AutonomousPlanner())
+    coding_worker = SequentialCodingWorker()
+    review_worker = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Review reply",
+            "user_reply": "Review reply",
+            "internal_summary": "Run one focused smoke test before calling the project ready to test.",
+        }
+    )
+    workflow.delegation.coding_agent = coding_worker
+    workflow.delegation.reviewer_agent = review_worker
+
+    result = workflow.handle_chat(
+        thread_id=None,
+        user_message="Please build a small tic-tac-toe project with a real repository structure and stop when it is ready to test.",
+    )
+
+    assert result["route"] == "coding"
+    assert len(coding_worker.calls) == 3
+    assert "Current step 1 of 3" in coding_worker.calls[0]["internal_task"]
+    assert "Current step 2 of 3" in coding_worker.calls[1]["internal_task"]
+    assert "Current step 3 of 3" in coding_worker.calls[2]["internal_task"]
+    assert result["approval_request"] is not None
+    assert "autonomously" in result["reply"].lower()
+
+    artifacts = {artifact["kind"]: artifact for artifact in store.list_artifacts(result["thread"]["id"])}
+    project_state = artifacts["project_state"]["content"]
+    assert project_state["autonomous_mode"] is True
+    assert project_state["pending_step"] == "Request one smoke test execution for src/main.py."
+    assert len(project_state["completed_steps"]) == 2
+    assert project_state["ready_to_test"] is False
+
+
+def test_approve_execution_resumes_autonomous_project_run(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+    from ai_hub.tools.file_tools import write_file
+
+    store = HubStore()
+    workflow = ManagerWorkflow(store=store, planner=DeterministicPlanner())
+    thread = store.ensure_thread(None)
+    write_file(thread["id"], "src/main.py", "print('ready')\n")
+
+    store.upsert_artifact(
+        thread_id=thread["id"],
+        kind="project_plan",
+        title="Project Plan",
+        summary="Autonomous project plan",
+        content={
+            "user_message": "Continue project",
+            "summary": "Autonomous project plan",
+            "repo_structure": ["src/main.py - entry point"],
+            "steps": ["Create the entry point.", "Run one smoke test for src/main.py.", "Mark the project ready to test."],
+            "validation_steps": ["Run one smoke test for src/main.py."],
+            "completion_criteria": ["The entry point runs successfully."],
+            "project_outline": {
+                "summary": "Autonomous project plan",
+                "repo_structure": ["src/main.py - entry point"],
+                "steps": ["Create the entry point.", "Run one smoke test for src/main.py.", "Mark the project ready to test."],
+                "validation_steps": [],
+                "completion_criteria": ["The entry point runs successfully."],
+                "autonomous_execution": True,
+            },
+        },
+    )
+    store.upsert_artifact(
+        thread_id=thread["id"],
+        kind="project_state",
+        title="Project State",
+        summary="Waiting for approved execution.",
+        content={
+            "phase": "awaiting_approval",
+            "awaiting_user_feedback": False,
+            "autonomous_mode": True,
+            "ready_to_test": False,
+            "last_user_request": "Continue project",
+            "last_summary": "Waiting for approved execution.",
+            "latest_status": "approval_required",
+            "steps": ["Create the entry point.", "Run one smoke test for src/main.py.", "Mark the project ready to test."],
+            "completed_steps": ["Create the entry point."],
+            "pending_step": "Run one smoke test for src/main.py.",
+            "remaining_steps": ["Mark the project ready to test."],
+            "next_steps": ["Mark the project ready to test."],
+        },
+    )
+
+    approval = store.create_approval_request(
+        thread_id=thread["id"],
+        agent_role="coding",
+        tool_name="request_python_execution",
+        command={
+            "thread_id": thread["id"],
+            "argv": ["src/main.py"],
+            "preview": "python src/main.py",
+            "rationale": "Smoke test the entry point.",
+        },
+        rationale="Smoke test the entry point.",
+    )
+
+    coding_worker = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Project is ready to test.",
+            "user_reply": "Project is ready to test.",
+            "internal_summary": "Executed actions: none. Blocked actions: none. Approval request created: no. Self-check: No immediate follow-up risk was detected from the executed action batch.",
+            "actions_executed": [],
+            "actions_blocked": [],
+            "workspace": str(tmp_path / "workspaces" / thread["id"]),
+            "internal_payload": {
+                "language": "en",
+                "thread_id": thread["id"],
+                "task": "Finalize ready-to-test state.",
+                "self_check": {
+                    "inspected_files": [],
+                    "touched_paths": [],
+                    "follow_up": [],
+                    "summary": "No immediate follow-up risk was detected from the executed action batch.",
+                },
+            },
+        }
+    )
+    workflow.delegation.coding_agent = coding_worker
+    workflow.delegation.reviewer_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Review reply",
+            "user_reply": "Review reply",
+            "internal_summary": "The ready-to-test handoff is acceptable.",
+        }
+    )
+
+    result = workflow.approve_execution(approval["id"])
+
+    assert result["status"] == "executed"
+    assert result.get("continuation") is not None
+    assert len(coding_worker.calls) == 1
+
+    project_state = store.get_artifact(thread["id"], "project_state")["content"]
+    assert project_state["ready_to_test"] is True
+    assert project_state["pending_step"] is None
+    assert len(project_state["completed_steps"]) == 3
+    assert project_state["awaiting_user_feedback"] is True
+
+
+def test_failed_execution_triggers_autonomous_debug_repair_loop(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+
+    store = HubStore()
+    workflow = ManagerWorkflow(store=store, planner=DeterministicPlanner())
+    thread = store.ensure_thread(None)
+
+    store.upsert_artifact(
+        thread_id=thread["id"],
+        kind="project_plan",
+        title="Project Plan",
+        summary="Autonomous project plan",
+        content={
+            "project_outline": {
+                "summary": "Autonomous project plan",
+                "repo_structure": ["src/main.py - entry point"],
+                "steps": ["Create the entry point.", "Run one smoke test for src/main.py.", "Mark the project ready to test."],
+                "validation_steps": [],
+                "completion_criteria": ["The entry point runs successfully."],
+                "autonomous_execution": True,
+            },
+        },
+    )
+    store.upsert_artifact(
+        thread_id=thread["id"],
+        kind="project_state",
+        title="Project State",
+        summary="Waiting for approved execution.",
+        content={
+            "phase": "awaiting_approval",
+            "awaiting_user_feedback": False,
+            "autonomous_mode": True,
+            "ready_to_test": False,
+            "last_user_request": "Continue project",
+            "last_summary": "Waiting for approved execution.",
+            "latest_status": "approval_required",
+            "steps": ["Create the entry point.", "Run one smoke test for src/main.py.", "Mark the project ready to test."],
+            "completed_steps": ["Create the entry point."],
+            "pending_step": "Run one smoke test for src/main.py.",
+            "remaining_steps": ["Mark the project ready to test."],
+            "next_steps": ["Mark the project ready to test."],
+            "debug_attempts": 0,
+        },
+    )
+
+    approval = store.create_approval_request(
+        thread_id=thread["id"],
+        agent_role="coding",
+        tool_name="request_python_execution",
+        command={
+            "thread_id": thread["id"],
+            "argv": ["src/main.py"],
+            "preview": "python src/main.py",
+            "rationale": "Smoke test the entry point.",
+        },
+        rationale="Smoke test the entry point.",
+    )
+
+    monkeypatch.setattr(
+        "ai_hub.orchestration.workflow.execute_python_approval",
+        lambda command: {
+            "command": ["python", "src/main.py"],
+            "command_kind": "python_execution",
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "Traceback (most recent call last):\nModuleNotFoundError: No module named 'missing_pkg'",
+            "workspace": str(tmp_path / "workspaces" / thread["id"]),
+            "sandbox_backend": "subprocess",
+        },
+    )
+
+    coding_worker = RecordingWorker(
+        {
+            "status": "completed_with_approval",
+            "reply": "Prepared another execution request.",
+            "user_reply": "Prepared another execution request.",
+            "internal_summary": "Executed actions: create_file, request_execution. Blocked actions: none. Approval request created: yes.",
+            "actions_executed": [
+                {"action_type": "create_file", "target": "src/main.py"},
+                {"action_type": "request_execution", "target": "src/main.py"},
+            ],
+            "actions_blocked": [],
+            "workspace": str(tmp_path / "workspaces" / thread["id"]),
+            "approval_request": {
+                "tool_name": "request_python_execution",
+                "command": {
+                    "thread_id": thread["id"],
+                    "argv": ["src/main.py"],
+                    "preview": "python src/main.py",
+                    "rationale": "Retry after repair.",
+                },
+                "rationale": "Retry after repair.",
+            },
+            "internal_payload": {
+                "language": "en",
+                "thread_id": thread["id"],
+                "task": "Repair the entry point after the failed run.",
+                "self_check": {
+                    "inspected_files": [],
+                    "touched_paths": ["src/main.py"],
+                    "follow_up": ["Runtime validation is still pending user approval."],
+                    "summary": "Follow-up: Runtime validation is still pending user approval.",
+                },
+            },
+        }
+    )
+    workflow.delegation.coding_agent = coding_worker
+    workflow.delegation.reviewer_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Review reply",
+            "user_reply": "Review reply",
+            "internal_summary": "The repair direction is reasonable.",
+        }
+    )
+
+    result = workflow.approve_execution(approval["id"])
+
+    assert result["status"] == "failed"
+    assert result.get("continuation") is not None
+    assert len(coding_worker.calls) == 1
+    assert "ModuleNotFoundError" in coding_worker.calls[0]["internal_task"]
+    assert "Current step 2 of 3: Run one smoke test for src/main.py." in coding_worker.calls[0]["internal_task"]
+
+    project_state = store.get_artifact(thread["id"], "project_state")["content"]
+    assert project_state["phase"] == "awaiting_approval"
+    assert project_state["debug_attempts"] == 1
+
+
+def test_user_feedback_resumes_blocked_autonomous_project_from_current_state(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+
+    store = HubStore()
+    workflow = ManagerWorkflow(store=store, planner=DeterministicPlanner())
+    thread = store.ensure_thread(None)
+
+    store.upsert_artifact(
+        thread_id=thread["id"],
+        kind="project_plan",
+        title="Project Plan",
+        summary="Stored project plan.",
+        content={
+            "summary": "Stored project plan.",
+            "repo_structure": ["src/game_logic.py", "src/gui.py", "src/main.py"],
+            "steps": [
+                "Implement core game logic.",
+                "Develop the GUI layout.",
+                "Implement the 1v1 game loop.",
+            ],
+            "validation_steps": [],
+            "completion_criteria": ["The project is ready for a first test run."],
+            "project_outline": {
+                "summary": "Stored project plan.",
+                "repo_structure": ["src/game_logic.py", "src/gui.py", "src/main.py"],
+                "steps": [
+                    "Implement core game logic.",
+                    "Develop the GUI layout.",
+                    "Implement the 1v1 game loop.",
+                ],
+                "validation_steps": [],
+                "completion_criteria": ["The project is ready for a first test run."],
+                "autonomous_execution": True,
+            },
+        },
+    )
+    store.upsert_artifact(
+        thread_id=thread["id"],
+        kind="project_state",
+        title="Project State",
+        summary="Implementation blocked after the GUI step.",
+        content={
+            "phase": "blocked",
+            "awaiting_user_feedback": True,
+            "autonomous_mode": True,
+            "ready_to_test": False,
+            "last_user_request": "Continue project",
+            "last_summary": "Implementation blocked after the GUI step.",
+            "latest_status": "blocked",
+            "repo_structure": ["src/game_logic.py", "src/gui.py", "src/main.py"],
+            "steps": [
+                "Implement core game logic.",
+                "Develop the GUI layout.",
+                "Implement the 1v1 game loop.",
+            ],
+            "completed_steps": [
+                "Implement core game logic.",
+                "Develop the GUI layout.",
+            ],
+            "pending_step": None,
+            "remaining_steps": ["Implement the 1v1 game loop."],
+            "next_steps": ["Implement the 1v1 game loop."],
+            "last_execution_result": {
+                "command": ["python", "src/main.py"],
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "Traceback ... NameError: name 'TicTacToeGame' is not defined",
+            },
+        },
+    )
+
+    coding_worker = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Implemented the next step.",
+            "user_reply": "Implemented the next step.",
+            "internal_summary": "Executed actions: create_file. Blocked actions: none. Approval request created: no.",
+            "actions_executed": [{"action_type": "create_file", "target": "src/main.py"}],
+            "actions_blocked": [],
+            "workspace": str(tmp_path / "workspaces" / thread["id"]),
+            "internal_payload": {
+                "language": "en",
+                "thread_id": thread["id"],
+                "task": "Continue from the blocked project state.",
+                "self_check": {
+                    "inspected_files": [],
+                    "touched_paths": ["src/main.py"],
+                    "follow_up": [],
+                    "summary": "No immediate follow-up risk was detected.",
+                },
+            },
+        }
+    )
+    workflow.delegation.coding_agent = coding_worker
+    workflow.delegation.reviewer_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Review reply",
+            "user_reply": "Review reply",
+            "internal_summary": "The continuation step looks acceptable.",
+        }
+    )
+
+    result = workflow.handle_chat(
+        thread_id=thread["id"],
+        user_message="Please continue and keep building on the current project state.",
+    )
+
+    assert result["route"] == "coding"
+    assert len(coding_worker.calls) == 1
+    internal_task = coding_worker.calls[0]["internal_task"]
+    assert "Project phase: blocked" in internal_task
+    assert "Completed steps: ['Implement core game logic.', 'Develop the GUI layout.']" in internal_task
+    assert "NameError" in internal_task
+    assert "Current step 3 of 3: Implement the 1v1 game loop." in internal_task
+
+
+def test_dependency_install_approval_retries_same_autonomous_step(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+
+    store = HubStore()
+    workflow = ManagerWorkflow(store=store, planner=DeterministicPlanner())
+    thread = store.ensure_thread(None)
+
+    store.upsert_artifact(
+        thread_id=thread["id"],
+        kind="project_plan",
+        title="Project Plan",
+        summary="Stored plan.",
+        content={
+            "project_outline": {
+                "summary": "Build the app.",
+                "steps": ["Implement the application shell.", "Run a smoke test."],
+                "repo_structure": ["src/main.py"],
+                "validation_steps": [],
+                "completion_criteria": ["App starts without errors."],
+                "autonomous_execution": True,
+            },
+        },
+    )
+    store.upsert_artifact(
+        thread_id=thread["id"],
+        kind="project_state",
+        title="Project State",
+        summary="Waiting for dependency approval.",
+        content={
+            "phase": "awaiting_approval",
+            "awaiting_user_feedback": False,
+            "autonomous_mode": True,
+            "ready_to_test": False,
+            "last_user_request": "Continue project",
+            "last_summary": "Waiting for dependency approval.",
+            "latest_status": "completed_with_approval",
+            "steps": ["Implement the application shell.", "Run a smoke test."],
+            "completed_steps": [],
+            "pending_step": "Implement the application shell.",
+            "remaining_steps": ["Run a smoke test."],
+            "next_steps": ["Run a smoke test."],
+        },
+    )
+
+    approval = store.create_approval_request(
+        thread_id=thread["id"],
+        agent_role="coding",
+        tool_name="install_python_requirements",
+        command={
+            "kind": "pip_install",
+            "thread_id": thread["id"],
+            "packages": ["requests"],
+            "preview": "python -m pip install requests",
+            "rationale": "Install missing dependencies.",
+        },
+        rationale="Install missing dependencies.",
+    )
+
+    monkeypatch.setattr(
+        "ai_hub.orchestration.workflow.execute_python_approval",
+        lambda command: {
+            "command": ["python", "-m", "pip", "install", "requests"],
+            "command_kind": "pip_install",
+            "returncode": 0,
+            "stdout": "ok",
+            "stderr": "",
+            "workspace": str(tmp_path / "workspaces" / thread["id"]),
+            "sandbox_backend": "subprocess",
+            "packages": ["requests"],
+        },
+    )
+
+    coding_worker = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Implemented the application shell.",
+            "user_reply": "Implemented the application shell.",
+            "internal_summary": "Executed actions: create_file. Blocked actions: none. Approval request created: no.",
+            "actions_executed": [{"action_type": "create_file", "target": "src/main.py"}],
+            "actions_blocked": [],
+            "workspace": str(tmp_path / "workspaces" / thread["id"]),
+            "internal_payload": {
+                "language": "en",
+                "thread_id": thread["id"],
+                "task": "Implement the application shell.",
+                "self_check": {
+                    "inspected_files": [],
+                    "touched_paths": ["src/main.py"],
+                    "follow_up": [],
+                    "summary": "No immediate follow-up risk was detected.",
+                },
+            },
+        }
+    )
+    workflow.delegation.coding_agent = coding_worker
+    workflow.delegation.reviewer_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Review reply",
+            "user_reply": "Review reply",
+            "internal_summary": "The step looks acceptable.",
+        }
+    )
+
+    result = workflow.approve_execution(approval["id"])
+
+    assert result["status"] == "executed"
+    assert result.get("continuation") is not None
+    assert len(coding_worker.calls) == 1
+    assert "Current step 1 of 2: Implement the application shell." in coding_worker.calls[0]["internal_task"]
 
 def test_planning_context_includes_project_memory(monkeypatch, tmp_path):
     configure_paths(monkeypatch, tmp_path)
@@ -648,6 +1421,166 @@ def test_planning_context_includes_project_memory(monkeypatch, tmp_path):
 
     assert "Project memory:" in planner.history_calls[0]
     assert "Existing project memory summary." in planner.history_calls[0]
+
+
+def test_manager_can_persist_english_preference_per_thread(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+    from ai_hub.schemas.manager_plan import ManagerPlan
+
+    class PreferencePlanner:
+        def __init__(self) -> None:
+            self.user_languages: list[str] = []
+
+        def plan(self, history_text: str, user_message: str, user_language: str):
+            self.user_languages.append(user_language)
+            return {
+                "enabled": True,
+                "source": "ollama",
+                "plan": ManagerPlan(
+                    summary="Direct reply.",
+                    decision="direct",
+                    reason="No worker required.",
+                    user_reply="English reply." if user_language == "en" else "Deutsche Antwort.",
+                    internal_task_for_worker="",
+                    approval_needed=False,
+                ),
+            }
+
+    store = HubStore()
+    planner = PreferencePlanner()
+    workflow = ManagerWorkflow(store=store, planner=planner)
+
+    first = workflow.handle_chat(thread_id=None, user_message="Bitte sprich ab jetzt nur noch auf Englisch mit mir.")
+    second = workflow.handle_chat(thread_id=first["thread"]["id"], user_message="Wie ist der aktuelle Stand?")
+
+    assert planner.user_languages == ["en", "en"]
+    assert second["reply"] == "English reply."
+    preferences = store.get_artifact(first["thread"]["id"], "manager_preferences")
+    assert preferences["content"]["preferred_user_language"] == "en"
+
+
+def test_manager_full_implementation_followup_runs_autonomous_steps_from_stored_plan(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+    from ai_hub.schemas.manager_plan import ManagerPlan
+
+    class PlanThenCodingPlanner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def plan(self, history_text: str, user_message: str, user_language: str):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "enabled": True,
+                    "source": "ollama",
+                    "plan": ManagerPlan(
+                        summary="Plan the project first.",
+                        decision="plan",
+                        reason="The user explicitly requested a step-by-step plan.",
+                        user_reply="I will prepare the plan first.",
+                        internal_task_for_worker="Prepare a step-by-step project plan.",
+                        approval_needed=False,
+                    ),
+                }
+            return {
+                "enabled": True,
+                "source": "ollama",
+                "plan": ManagerPlan(
+                    summary="Start implementation.",
+                    decision="coding",
+                    reason="The user approved the plan and wants the full implementation.",
+                    user_reply="I will start implementing now.",
+                    internal_task_for_worker="Start implementing the approved project.",
+                    approval_needed=False,
+                ),
+            }
+
+    store = HubStore()
+    workflow = ManagerWorkflow(store=store, planner=PlanThenCodingPlanner())
+    research_worker = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Research reply",
+            "user_reply": "Research reply",
+            "internal_summary": "A small repo with engine, UI, AI, and entry point is the right shape.",
+            "internal_payload": {
+                "language": "en",
+                "thread_id": "ignored",
+                "task": "research",
+                "summary": "A small repo with engine, UI, AI, and entry point is the right shape.",
+                "findings": ["Separate engine, UI, AI, and entry point files."],
+                "assumptions": [],
+                "open_questions": [],
+                "recommendation": "Implement engine first, then UI, then AI and final integration.",
+                "sources": [],
+            },
+        }
+    )
+    review_worker = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Review reply",
+            "user_reply": "Review reply",
+            "internal_summary": "The plan is sound. After approval, implementation can proceed step by step.",
+            "internal_payload": {
+                "language": "en",
+                "thread_id": "ignored",
+                "task": "review",
+                "summary": "The plan is sound.",
+                "findings": ["Keep the first implementation step small and coherent."],
+                "assumptions": [],
+                "open_questions": [],
+                "recommendation": "Move through the stored steps and summarize the final result.",
+            },
+        }
+    )
+    coding_worker = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "File created.",
+            "user_reply": "File created.",
+            "internal_summary": "Executed actions: create_file. Blocked actions: none. Approval request created: no. Self-check: Inspected files after execution: src/main.py.",
+            "actions_executed": [{"action_type": "create_file", "target": "src/main.py"}],
+            "actions_blocked": [],
+            "workspace": str(tmp_path / "workspaces" / "thread"),
+            "internal_payload": {
+                "language": "en",
+                "thread_id": "ignored",
+                "task": "autonomous step",
+                "self_check": {
+                    "inspected_files": [{"path": "src/main.py", "preview": "print('ok')\n", "bytes": 12}],
+                    "touched_paths": ["src/main.py"],
+                    "follow_up": [],
+                    "summary": "Inspected files after execution: src/main.py.",
+                },
+            },
+        }
+    )
+    workflow.delegation.research_agent = research_worker
+    workflow.delegation.reviewer_agent = review_worker
+    workflow.delegation.coding_agent = coding_worker
+
+    plan_result = workflow.handle_chat(
+        thread_id=None,
+        user_message="Please code a tic tac toe game with a gui interface. It should have a 1v1 mode and a ai mode. I want it as clean as possible with nice features. Give me a step by step implementation plan.",
+    )
+    follow_up = workflow.handle_chat(
+        thread_id=plan_result["thread"]["id"],
+        user_message="This looks good! Start the implementation and let me know when you are done. Also write me a quick summary of what features you implemented.",
+    )
+
+    assert follow_up["route"] == "coding"
+    assert len(coding_worker.calls) >= 2
+    assert "Current step 1 of" in coding_worker.calls[0]["internal_task"]
+    assert "Current step 2 of" in coding_worker.calls[1]["internal_task"]
+    assert "ready for a first test run" in follow_up["reply"]
+    assert "Implemented steps:" in follow_up["reply"]
 
 
 def test_manager_reviews_regular_coding_result_and_stores_self_check(monkeypatch, tmp_path):

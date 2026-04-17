@@ -47,10 +47,12 @@ You are assisting a local manager agent inside a secure orchestration backend.
 You may help understand the request, choose the route, and draft the user-facing reply.
 You must never bypass approval rules, workspace restrictions, or backend tool policies.
 Internal worker instructions must be written in English.
+All stored repo plans, step names, validation notes, and completion criteria must be written in English.
 The user-facing reply must be written in this language code: {user_language}.
-When you choose decision="coding" for a bounded implementation slice, prefer meaningful file contents over empty stubs.
+When you choose decision="coding" for a bounded implementation step, prefer meaningful file contents over empty stubs.
 Only use empty file contents when the file is intentionally a placeholder such as an empty __init__.py.
-If the user asked for a project structure or a concrete first slice, the coding_plan should create a coherent small implementation, not only comments or placeholder headings.
+If the user asked for a project structure or a concrete first step, the coding_plan should create a coherent small implementation, not only comments or placeholder headings.
+Use the word "steps", not "slices", when you describe implementation sequencing.
 
 Recent thread context:
 {history_text}
@@ -79,11 +81,31 @@ Return JSON only with these fields:
         {{"action_type": "request_execution", "target": "src/main.py"}}
       ]
     }}
+  }},
+  "project_outline": {{
+    "summary": "optional English project summary",
+    "repo_structure": [
+      "src/main.py - entry point",
+      "src/game_logic.py - core rules"
+    ],
+    "steps": [
+      "Create the repository scaffold and shared module boundaries.",
+      "Implement the core game loop and wire the entry point."
+    ],
+    "validation_steps": [
+      "Run the main entry point once for a smoke test."
+    ],
+    "completion_criteria": [
+      "The project starts from main.py without import errors.",
+      "The requested first scenario is ready to test."
+    ],
+    "autonomous_execution": true_or_false
   }}
 }}
 
-Use decision="plan" when the user wants strategy, architecture, milestones, implementation slices, or feedback before coding starts.
+Use decision="plan" when the user wants strategy, architecture, milestones, implementation steps, or feedback before coding starts.
 Only include a non-empty coding_plan when decision="coding". Otherwise set coding_plan to null.
+Include project_outline when the request is a multi-file project, repo architecture task, or autonomous multi-step implementation. Otherwise set project_outline to null.
 """.strip()
 
         log_event(logger, "manager_ollama_request", model=self.model)
