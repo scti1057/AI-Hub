@@ -10,8 +10,26 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 
-from ai_hub.config import APP_USERNAME, APP_PASSWORD, SESSION_SECRET, VAPID_PUBLIC_KEY
-from ai_hub.logging_config import log_event, reset_request_id, set_request_id, setup_logging
+from ai_hub.config import (
+    APP_USERNAME,
+    APP_PASSWORD,
+    CHAT_BACKGROUND_TIMEOUT_SECONDS,
+    CHAT_THREAD_DUMP_ENABLED,
+    CHAT_THREAD_DUMP_INTERVAL_SECONDS,
+    CHAT_THREAD_DUMP_MAX_CHARS,
+    SESSION_SECRET,
+    VAPID_PUBLIC_KEY,
+)
+from ai_hub.logging_config import (
+    create_chat_run_log_dir,
+    log_event,
+    log_thread_dump,
+    reset_chat_log_dir,
+    reset_request_id,
+    set_chat_log_dir,
+    set_request_id,
+    setup_logging,
+)
 from ai_hub.memory.store import HubStore
 from ai_hub.memory.sqlite_db import init_db, upsert_push_subscription, delete_push_subscription
 from ai_hub.orchestration.workflow import ManagerWorkflow
@@ -75,13 +93,124 @@ workflow = ManagerWorkflow(store=store)
 
 
 def _run_chat_in_background(thread_id: str, user_message: str, pending_message_id: int, request_id: str) -> None:
-    token = set_request_id(request_id)
+    request_token = set_request_id(request_id)
+    run_dir = create_chat_run_log_dir(thread_id, request_id)
+    chat_log_token = set_chat_log_dir(str(run_dir))
     try:
-        workflow.process_enqueued_chat(
+        log_event(
+            logger,
+            "api_chat_run_started",
             thread_id=thread_id,
-            user_message=user_message,
             pending_message_id=pending_message_id,
+            run_log_dir=str(run_dir),
         )
+        result_holder: dict[str, object] = {}
+        error_holder: dict[str, Exception] = {}
+
+        def runner() -> None:
+            nested_request_token = set_request_id(request_id)
+            nested_chat_log_token = set_chat_log_dir(str(run_dir))
+            try:
+                log_event(
+                    logger,
+                    "api_chat_worker_started",
+                    thread_id=thread_id,
+                    pending_message_id=pending_message_id,
+                )
+                result_holder["result"] = workflow.process_enqueued_chat(
+                    thread_id=thread_id,
+                    user_message=user_message,
+                    pending_message_id=pending_message_id,
+                )
+                log_event(
+                    logger,
+                    "api_chat_worker_completed",
+                    thread_id=thread_id,
+                    pending_message_id=pending_message_id,
+                    result_type=type(result_holder.get("result")).__name__,
+                )
+            except Exception as exc:
+                error_holder["error"] = exc
+                log_event(
+                    logger,
+                    "api_chat_worker_failed",
+                    thread_id=thread_id,
+                    pending_message_id=pending_message_id,
+                    error=str(exc),
+                    exception_type=type(exc).__name__,
+                )
+            finally:
+                reset_chat_log_dir(nested_chat_log_token)
+                reset_request_id(nested_request_token)
+
+        worker_thread = threading.Thread(
+            target=runner,
+            name=f"chat-worker-{request_id}",
+            daemon=True,
+        )
+        worker_thread.start()
+        log_event(
+            logger,
+            "api_chat_worker_join_started",
+            thread_id=thread_id,
+            pending_message_id=pending_message_id,
+            timeout_seconds=CHAT_BACKGROUND_TIMEOUT_SECONDS,
+        )
+        remaining_timeout = CHAT_BACKGROUND_TIMEOUT_SECONDS
+        dump_interval = max(CHAT_THREAD_DUMP_INTERVAL_SECONDS, 1.0)
+        while worker_thread.is_alive() and remaining_timeout > 0:
+            wait_seconds = min(dump_interval, remaining_timeout)
+            worker_thread.join(timeout=wait_seconds)
+            remaining_timeout -= wait_seconds
+            if worker_thread.is_alive() and CHAT_THREAD_DUMP_ENABLED:
+                log_event(
+                    logger,
+                    "api_chat_worker_still_running",
+                    thread_id=thread_id,
+                    pending_message_id=pending_message_id,
+                    remaining_timeout_seconds=round(max(remaining_timeout, 0.0), 3),
+                )
+                log_thread_dump(
+                    logger,
+                    "api_chat_thread_dump",
+                    max_chars=CHAT_THREAD_DUMP_MAX_CHARS,
+                    thread_id=thread_id,
+                    pending_message_id=pending_message_id,
+                    remaining_timeout_seconds=round(max(remaining_timeout, 0.0), 3),
+                )
+        log_event(
+            logger,
+            "api_chat_worker_join_returned",
+            thread_id=thread_id,
+            pending_message_id=pending_message_id,
+            worker_alive=worker_thread.is_alive(),
+            has_error="error" in error_holder,
+            has_result="result" in result_holder,
+        )
+        if worker_thread.is_alive():
+            log_event(
+                logger,
+                "api_chat_background_timeout",
+                thread_id=thread_id,
+                pending_message_id=pending_message_id,
+                timeout_seconds=CHAT_BACKGROUND_TIMEOUT_SECONDS,
+            )
+            workflow.finalize_pending_timeout(
+                thread_id=thread_id,
+                pending_message_id=pending_message_id,
+                user_message=user_message,
+                timeout_seconds=CHAT_BACKGROUND_TIMEOUT_SECONDS,
+                worker_label="Kritiker-Agent / Reviewer agent",
+            )
+            log_event(
+                logger,
+                "api_chat_background_timeout_finalized",
+                thread_id=thread_id,
+                pending_message_id=pending_message_id,
+            )
+            return
+        if "error" in error_holder:
+            raise error_holder["error"]
     except Exception as exc:
         log_event(
             logger,
@@ -92,7 +221,8 @@ def _run_chat_in_background(thread_id: str, user_message: str, pending_message_i
             exception_type=type(exc).__name__,
         )
     finally:
-        reset_request_id(token)
+        reset_chat_log_dir(chat_log_token)
+        reset_request_id(request_token)
 
 
 @app.middleware("http")

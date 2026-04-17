@@ -14,4 +14,5 @@ Rules:
 - For project plans, challenge anything too broad, too optimistic, or insufficiently sequenced.
 - For implementation plans, ask whether the next slice is truly small enough and whether repo structure, tests, and debugging paths are credible.
 - For coding results, prioritize concrete bugs, test gaps, debugging blind spots, and evidence that the slice is incomplete or unstable.
+- For coding-result reviews, prefer high-level implementation summaries, risks, touched-file lists, and validation gaps over raw tool dumps or line-by-line code inspection.
 - When the proposed plan is not ready, say what must be clarified before implementation should continue.

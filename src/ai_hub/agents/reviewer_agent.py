@@ -5,8 +5,9 @@ import re
 from pathlib import Path
 from time import monotonic
 
+from ai_hub.config import REVIEWER_DEBUG_LOG_MAX_CHARS, REVIEWER_DEBUG_LOG_PROMPTS
 from ai_hub.language_policy import LanguagePolicy
-from ai_hub.logging_config import log_event, setup_logging
+from ai_hub.logging_config import log_event, log_text_block, setup_logging
 from ai_hub.llm.model_router import ModelRouter
 from ai_hub.llm.ollama_client import LLMServiceError, OllamaClient
 from ai_hub.memory.history import format_thread_history
@@ -55,8 +56,72 @@ class ReviewerAgent:
                 prompt_digest=prompt_digest,
                 worker_task_preview=worker_task[:160],
             )
+            if REVIEWER_DEBUG_LOG_PROMPTS:
+                log_event(
+                    logger,
+                    "reviewer_prompt_sections",
+                    thread_id=thread_id,
+                    model=self.model,
+                    prompt_digest=prompt_digest,
+                    system_prompt_chars=len(self.system_prompt),
+                    history_summary_chars=len(summary),
+                    user_task_chars=len(user_task),
+                    internal_task_chars=len(worker_task),
+                    user_language=language_context.user_language,
+                )
+                log_text_block(
+                    logger,
+                    "reviewer_prompt_body",
+                    prompt,
+                    max_chars=REVIEWER_DEBUG_LOG_MAX_CHARS,
+                    thread_id=thread_id,
+                    model=self.model,
+                    prompt_digest=prompt_digest,
+                )
+            log_event(
+                logger,
+                "reviewer_generate_started",
+                thread_id=thread_id,
+                model=self.model,
+                prompt_digest=prompt_digest,
+            )
             raw_response = self.client.generate(model=self.model, prompt=prompt, temperature=0.2)
+            log_event(
+                logger,
+                "reviewer_generate_completed",
+                thread_id=thread_id,
+                model=self.model,
+                prompt_digest=prompt_digest,
+                raw_response_chars=len(raw_response),
+            )
+            if REVIEWER_DEBUG_LOG_PROMPTS:
+                log_text_block(
+                    logger,
+                    "reviewer_raw_response",
+                    raw_response,
+                    max_chars=REVIEWER_DEBUG_LOG_MAX_CHARS,
+                    thread_id=thread_id,
+                    model=self.model,
+                    prompt_digest=prompt_digest,
+                )
+            log_event(
+                logger,
+                "reviewer_parse_started",
+                thread_id=thread_id,
+                model=self.model,
+                prompt_digest=prompt_digest,
+            )
             parsed = self._parse_response(raw_response)
+            log_event(
+                logger,
+                "reviewer_parse_completed",
+                thread_id=thread_id,
+                model=self.model,
+                prompt_digest=prompt_digest,
+                summary_chars=len(parsed["summary"]),
+                findings_count=len(parsed["findings"]),
+                open_questions_count=len(parsed["open_questions"]),
+            )
         except Exception as exc:
             log_event(
                 logger,
@@ -81,6 +146,14 @@ class ReviewerAgent:
         )
 
         reply = self._render_reply(parsed, language_context.user_language)
+        log_event(
+            logger,
+            "reviewer_returning_result",
+            thread_id=thread_id,
+            model=self.model,
+            prompt_digest=prompt_digest,
+            reply_chars=len(reply),
+        )
         return {
             "status": "completed",
             "reply": reply,

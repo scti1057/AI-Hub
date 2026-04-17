@@ -5,7 +5,7 @@ from time import monotonic
 import requests
 
 from ai_hub.config import OLLAMA_BASE_URL
-from ai_hub.logging_config import log_event, setup_logging
+from ai_hub.logging_config import get_request_id, log_event, reset_request_id, set_request_id, setup_logging
 
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,7 @@ class OllamaClient:
         started = monotonic()
         prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
         completion_event = threading.Event()
+        request_id = get_request_id()
 
         payload = {
             "model": model,
@@ -58,21 +59,41 @@ class OllamaClient:
         )
 
         def emit_waiting_logs() -> None:
-            for wait_seconds in (30, 60, 120, 240):
-                if completion_event.wait(wait_seconds):
-                    return
-                log_event(
-                    logger,
-                    "ollama_generate_still_waiting",
-                    model=model,
-                    prompt_digest=prompt_digest,
-                    elapsed_ms=int((monotonic() - started) * 1000),
-                )
+            token = set_request_id(request_id)
+            try:
+                for wait_seconds in (30, 60, 120, 240):
+                    if completion_event.wait(wait_seconds):
+                        return
+                    log_event(
+                        logger,
+                        "ollama_generate_still_waiting",
+                        model=model,
+                        prompt_digest=prompt_digest,
+                        elapsed_ms=int((monotonic() - started) * 1000),
+                    )
+            finally:
+                reset_request_id(token)
 
         watchdog = threading.Thread(target=emit_waiting_logs, name="ollama-generate-watchdog", daemon=True)
         watchdog.start()
         try:
+            log_event(
+                logger,
+                "ollama_http_post_started",
+                model=model,
+                prompt_digest=prompt_digest,
+                url=url,
+            )
             response = requests.post(url, json=payload, timeout=300)
+            log_event(
+                logger,
+                "ollama_http_post_returned",
+                model=model,
+                prompt_digest=prompt_digest,
+                status_code=response.status_code,
+                ok=response.ok,
+                elapsed_ms=int((monotonic() - started) * 1000),
+            )
         except requests.Timeout as exc:
             completion_event.set()
             log_event(
@@ -121,9 +142,35 @@ class OllamaClient:
                 status_code=response.status_code,
             )
 
+        log_event(
+            logger,
+            "ollama_response_json_parse_started",
+            model=model,
+            prompt_digest=prompt_digest,
+            elapsed_ms=int((monotonic() - started) * 1000),
+        )
         data = response.json()
+        log_event(
+            logger,
+            "ollama_response_json_parse_completed",
+            model=model,
+            prompt_digest=prompt_digest,
+            elapsed_ms=int((monotonic() - started) * 1000),
+            response_keys=",".join(sorted(data.keys())),
+        )
         completion_event.set()
         response_text = data.get("response", "").strip()
+        log_event(
+            logger,
+            "ollama_response_text_extracted",
+            model=model,
+            prompt_digest=prompt_digest,
+            elapsed_ms=int((monotonic() - started) * 1000),
+            response_chars=len(response_text),
+            has_thinking=bool(str(data.get("thinking", "")).strip()),
+            done=data.get("done"),
+            done_reason=data.get("done_reason"),
+        )
         if not response_text:
             raise LLMServiceError(
                 "Ollama returned an empty response.",

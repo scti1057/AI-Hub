@@ -1,10 +1,18 @@
 import logging
 import re
 from uuid import uuid4
-from time import monotonic
+from time import monotonic, sleep
 
+from ai_hub.config import POST_CODING_REVIEW_DELAY_SECONDS, REVIEWER_DEBUG_LOG_MAX_CHARS, REVIEWER_DEBUG_LOG_PROMPTS
 from ai_hub.language_policy import LanguagePolicy
-from ai_hub.logging_config import log_event, set_request_id, reset_request_id, get_request_id, setup_logging
+from ai_hub.logging_config import (
+    get_request_id,
+    log_event,
+    log_text_block,
+    reset_request_id,
+    set_request_id,
+    setup_logging,
+)
 from ai_hub.memory.history import format_thread_history
 from ai_hub.memory.store import HubStore
 from ai_hub.llm.manager_planner import ManagerPlanner
@@ -565,6 +573,15 @@ class ManagerWorkflow:
                 plan_validation_success=plan_validation_success,
             )
 
+            log_event(
+                logger,
+                "chat_processing_finalization_started",
+                thread_id=thread_id,
+                pending_message_id=pending_message_id,
+                final_route=route.decision.value,
+                approval_created=bool(approval),
+                reply_chars=len(reply),
+            )
             return self._finalize_pending_message(
                 thread_id=thread_id,
                 pending_message_id=pending_message_id,
@@ -1500,30 +1517,42 @@ class ManagerWorkflow:
 
         internal_payload = delegated_result.get("internal_payload") or {}
         self_check = internal_payload.get("self_check") or {}
-        file_context = []
-        file_context_meta = []
-        for item in (self_check.get("inspected_files") or [])[:3]:
-            preview = item.get("preview", "")
-            file_context.append(
-                f"File: {item.get('path', '')}\nPreview: {preview}"
-            )
-            file_context_meta.append(
-                {
-                    "path": item.get("path", ""),
-                    "preview_chars": len(preview),
-                    "bytes": item.get("bytes", 0),
-                }
-            )
+        touched_paths = self._dedupe_items(self_check.get("touched_paths") or [])
+        inspected_paths = self._dedupe_items(
+            [str(item.get("path", "")).strip() for item in (self_check.get("inspected_files") or [])]
+        )
+        actions_executed = delegated_result.get("actions_executed") or []
+        actions_blocked = delegated_result.get("actions_blocked") or []
+        executed_action_types = self._dedupe_items(
+            [str(item.get("action_type", "")).strip() for item in actions_executed]
+        )
+        blocked_action_types = self._dedupe_items(
+            [str(item.get("action_type", "")).strip() for item in actions_blocked]
+        )
+        primary_risks = self._dedupe_items(self_check.get("follow_up") or [])
+        touched_summary = ", ".join(touched_paths[:6]) if touched_paths else "No touched paths recorded."
+        inspected_summary = ", ".join(inspected_paths[:6]) if inspected_paths else "No inspected files recorded."
+        executed_summary = ", ".join(executed_action_types[:6]) if executed_action_types else "none"
+        blocked_summary = ", ".join(blocked_action_types[:6]) if blocked_action_types else "none"
         review_task = (
-            "Review the latest coding step. Focus on likely bugs, missing validation, "
-            "scope creep, and the best next check.\n\n"
+            "Review the latest coding step as a critical implementation reviewer. "
+            "Do not do line-by-line code review and do not parse raw tool dumps. "
+            "Use the implementation summary below to identify likely risks, missing validation, "
+            "signs that the slice is too large, and the single best next check.\n\n"
             f"Original user request: {user_message}\n"
             f"Coding status: {delegated_result.get('status')}\n"
             f"Coding summary: {delegated_result.get('internal_summary', '')}\n"
             f"Self-check summary: {self_check.get('summary', '')}\n"
-            f"Actions executed: {delegated_result.get('actions_executed', [])}\n"
-            f"Actions blocked: {delegated_result.get('actions_blocked', [])}\n\n"
-            f"File context:\n{chr(10).join(file_context) if file_context else 'No file previews available.'}"
+            f"Executed action types: {executed_summary}\n"
+            f"Blocked action types: {blocked_summary}\n"
+            f"Touched paths: {touched_summary}\n"
+            f"Inspected files: {inspected_summary}\n"
+            f"Known follow-up risks: {primary_risks[:4] if primary_risks else 'none'}\n\n"
+            "Review goals:\n"
+            "- Call out the highest-risk gap in the slice.\n"
+            "- Say whether additional validation is needed before expanding scope.\n"
+            "- Recommend the next best check or test.\n"
+            "- Avoid detailed code commentary unless a serious risk is obvious from the summary."
         )
         log_event(
             logger,
@@ -1531,20 +1560,54 @@ class ManagerWorkflow:
             thread_id=thread_id,
             coding_status=delegated_result.get("status"),
             inspected_file_count=len(self_check.get("inspected_files") or []),
-            file_context_count=len(file_context),
-            file_context_chars=sum(len(entry) for entry in file_context),
-            file_context_meta=file_context_meta,
+            touched_path_count=len(touched_paths),
+            touched_paths=touched_paths[:6],
+            inspected_paths=inspected_paths[:6],
+            follow_up_count=len(primary_risks),
             review_task_chars=len(review_task),
-            actions_executed_count=len(delegated_result.get("actions_executed") or []),
-            actions_blocked_count=len(delegated_result.get("actions_blocked") or []),
+            actions_executed_count=len(actions_executed),
+            actions_blocked_count=len(actions_blocked),
         )
+        if REVIEWER_DEBUG_LOG_PROMPTS:
+            log_text_block(
+                logger,
+                "post_coding_review_task",
+                review_task,
+                max_chars=REVIEWER_DEBUG_LOG_MAX_CHARS,
+                thread_id=thread_id,
+                coding_status=delegated_result.get("status"),
+                review_task_chars=len(review_task),
+            )
+        if POST_CODING_REVIEW_DELAY_SECONDS > 0:
+            log_event(
+                logger,
+                "post_coding_review_delay",
+                thread_id=thread_id,
+                delay_seconds=POST_CODING_REVIEW_DELAY_SECONDS,
+            )
+            sleep(POST_CODING_REVIEW_DELAY_SECONDS)
         started = monotonic()
+        log_event(
+            logger,
+            "post_coding_review_delegation_started",
+            thread_id=thread_id,
+            coding_status=delegated_result.get("status"),
+            review_task_chars=len(review_task),
+        )
         review_result = self.delegation.execute(
             ManagerDecision.REVIEW,
             thread_id,
             user_message,
             history,
             internal_task=review_task,
+        )
+        log_event(
+            logger,
+            "post_coding_review_delegation_returned",
+            thread_id=thread_id,
+            status=review_result.get("status"),
+            reply_chars=len(review_result.get("reply", "") or ""),
+            summary_chars=len(review_result.get("internal_summary", "") or ""),
         )
         log_event(
             logger,
@@ -1802,30 +1865,192 @@ class ManagerWorkflow:
         route: str,
         approval: dict | None,
     ) -> dict:
+        log_event(
+            logger,
+            "pending_finalize_started",
+            thread_id=thread_id,
+            pending_message_id=pending_message_id,
+            route=route,
+            reply_chars=len(reply),
+            approval_created=bool(approval),
+        )
+        current = self.store.update_message(pending_message_id)
+        log_event(
+            logger,
+            "pending_finalize_current_loaded",
+            thread_id=thread_id,
+            pending_message_id=pending_message_id,
+            current_found=current is not None,
+        )
+        current_meta = dict(current.get("meta") or {}) if current else {}
+        if current_meta.get("final_decision") == "timeout":
+            log_event(
+                logger,
+                "pending_finalize_skipped_due_to_timeout",
+                thread_id=thread_id,
+                pending_message_id=pending_message_id,
+            )
+            thread = self.store.get_thread(thread_id)
+            messages = self.store.list_messages(thread_id)
+            return {
+                "thread": thread,
+                "message": current,
+                "reply": current.get("content", "") if current else reply,
+                "route": current_meta.get("route", "error"),
+                "approval_request": None,
+                "messages": messages,
+            }
+        log_event(
+            logger,
+            "pending_finalize_store_update_started",
+            thread_id=thread_id,
+            pending_message_id=pending_message_id,
+        )
         pending_message = self.store.update_message(
             pending_message_id,
             content=reply,
             agent="manager",
             meta=meta,
         )
+        log_event(
+            logger,
+            "pending_finalize_store_update_completed",
+            thread_id=thread_id,
+            pending_message_id=pending_message_id,
+            message_found=pending_message is not None,
+        )
         thread = self.store.get_thread(thread_id)
+        log_event(
+            logger,
+            "pending_finalize_thread_loaded",
+            thread_id=thread_id,
+            pending_message_id=pending_message_id,
+            thread_found=thread is not None,
+        )
+        messages = self.store.list_messages(thread_id)
+        log_event(
+            logger,
+            "pending_finalize_completed",
+            thread_id=thread_id,
+            pending_message_id=pending_message_id,
+            route=route,
+            message_count=len(messages),
+        )
         return {
             "thread": thread,
             "message": pending_message,
             "reply": reply,
             "route": route,
             "approval_request": approval,
-            "messages": self.store.list_messages(thread_id),
+            "messages": messages,
         }
 
+    def finalize_pending_timeout(
+        self,
+        thread_id: str,
+        pending_message_id: int,
+        user_message: str,
+        *,
+        timeout_seconds: float,
+        worker_label: str | None = None,
+    ) -> dict:
+        language_context = self.language_policy.build_context(user_message)
+        label = worker_label or self.language_policy.user_text(
+            language_context.user_language,
+            "ein interner Agent",
+            "an internal agent",
+        )
+        if language_context.user_language == "de":
+            reply = (
+                "Die Verarbeitung wurde automatisch abgebrochen, weil ein interner Schritt zu lange "
+                "keine verwertbare Antwort geliefert hat.\n"
+                f"- Betroffener Schritt: {label}\n"
+                f"- Timeout: `{int(timeout_seconds)}` Sekunden\n"
+                "- Nächster Schritt: Bitte den Lauf erneut versuchen oder das Debug-Log prüfen."
+            )
+        else:
+            reply = (
+                "Processing was stopped automatically because an internal step took too long without "
+                "returning a usable result.\n"
+                f"- Affected step: {label}\n"
+                f"- Timeout: `{int(timeout_seconds)}` seconds\n"
+                "- Next step: Retry the run or inspect the debug trace."
+            )
+        log_event(
+            logger,
+            "pending_timeout_finalization_started",
+            thread_id=thread_id,
+            pending_message_id=pending_message_id,
+            timeout_seconds=timeout_seconds,
+            worker_label=label,
+        )
+        return self._finalize_pending_message(
+            thread_id=thread_id,
+            pending_message_id=pending_message_id,
+            reply=reply,
+            meta={
+                "route": "error",
+                "approval_request_id": None,
+                "planning_note": None,
+                "manager_source": "timeout",
+                "fallback_reason": None,
+                "llm_decision": None,
+                "final_decision": "timeout",
+                "structured_plan_used": False,
+                "fallback_to_heuristic": False,
+                "structured_action_count": 0,
+                "plan_validation_success": False,
+                "processing": False,
+                "processing_comment": self.language_policy.user_text(
+                    language_context.user_language,
+                    "Verarbeitung wegen Timeout abgebrochen",
+                    "Processing stopped because of a timeout",
+                ),
+                "language_policy": {
+                    "user_language": language_context.user_language,
+                    "internal_language": "en",
+                },
+                "internal_payload": {
+                    "language": "en",
+                    "thread_id": thread_id,
+                    "task": language_context.internal_message,
+                    "source": "timeout",
+                    "error": {
+                        "code": "chat_processing_timeout",
+                        "message": f"Background processing exceeded {timeout_seconds} seconds.",
+                        "worker_label": label,
+                    },
+                },
+            },
+            route="error",
+            approval=None,
+        )
+
     def _update_pending_status(self, pending_message_id: int, comment: str) -> None:
+        log_event(
+            logger,
+            "pending_status_update_started",
+            pending_message_id=pending_message_id,
+            comment=comment,
+        )
         current = self.store.update_message(pending_message_id)
         if current is None:
+            log_event(
+                logger,
+                "pending_status_update_missing_message",
+                pending_message_id=pending_message_id,
+            )
             return
         meta = dict(current.get("meta") or {})
         meta["processing"] = True
         meta["processing_comment"] = comment
         self.store.update_message(pending_message_id, meta=meta)
+        log_event(
+            logger,
+            "pending_status_update_completed",
+            pending_message_id=pending_message_id,
+            comment=comment,
+        )
 
     def _processing_comment_for_route(self, decision: ManagerDecision, user_language: str) -> str:
         if decision == ManagerDecision.DIRECT:
