@@ -74,30 +74,6 @@ class CodingAgent:
         workspace = file_tools.ensure_thread_workspace(thread_id)
         internal_task = internal_task or language_context.internal_message
         blocked_path = self._detect_blocked_path_request(user_task)
-        try:
-            action_batch, structured_plan_used, fallback_to_heuristic, plan_validation_success = self._resolve_action_batch(
-                user_task,
-                internal_task,
-                structured_plan,
-            )
-        except Exception as exc:
-            log_event(logger, "coding_error", thread_id=thread_id, model=self.model, error=str(exc))
-            return self._error_result(thread_id, internal_task, language_context.user_language, exc)
-        action_types = [action.action_type for action in action_batch.actions]
-
-        log_event(
-            logger,
-            "coding_action_batch",
-            thread_id=thread_id,
-            parsed_action_count=len(action_batch.actions),
-            action_types=",".join(action_types),
-            blocked_path=blocked_path,
-            structured_plan_used=structured_plan_used,
-            fallback_to_heuristic=fallback_to_heuristic,
-            structured_action_count=len(action_batch.actions) if structured_plan_used else 0,
-            plan_validation_success=plan_validation_success,
-        )
-
         if blocked_path:
             log_event(logger, "coding_blocked_path", thread_id=thread_id, path=blocked_path)
             blocked_result = CodingActionResult(
@@ -123,6 +99,34 @@ class CodingAgent:
                 approval_request=None,
                 user_language=language_context.user_language,
             )
+        try:
+            action_batch, structured_plan_used, fallback_to_heuristic, plan_validation_success = self._resolve_action_batch(
+                user_task,
+                internal_task,
+                structured_plan,
+            )
+            action_batch = self._inject_contract_reads(
+                thread_id=thread_id,
+                action_batch=action_batch,
+                internal_task=internal_task,
+            )
+        except Exception as exc:
+            log_event(logger, "coding_error", thread_id=thread_id, model=self.model, error=str(exc))
+            return self._error_result(thread_id, internal_task, language_context.user_language, exc)
+        action_types = [action.action_type for action in action_batch.actions]
+
+        log_event(
+            logger,
+            "coding_action_batch",
+            thread_id=thread_id,
+            parsed_action_count=len(action_batch.actions),
+            action_types=",".join(action_types),
+            blocked_path=blocked_path,
+            structured_plan_used=structured_plan_used,
+            fallback_to_heuristic=fallback_to_heuristic,
+            structured_action_count=len(action_batch.actions) if structured_plan_used else 0,
+            plan_validation_success=plan_validation_success,
+        )
 
         execution_result = self._execute_action_batch(
             thread_id=thread_id,
@@ -412,12 +416,13 @@ class CodingAgent:
             executed=executed,
             blocked=blocked,
             approval_request=approval_request,
+            internal_task=internal_task,
         )
         internal_summary = self._build_internal_summary(executed, blocked, approval_request_created, self_check)
 
         if blocked:
             status = "blocked"
-        elif approval_request and executed:
+        elif approval_request and any(result.action_type != "request_execution" for result in executed):
             status = "completed_with_approval"
         elif approval_request:
             status = "approval_required"
@@ -639,13 +644,82 @@ class CodingAgent:
             "self_check": self_check or {},
         }
 
+    def _extract_contract_paths(self, internal_task: str) -> dict[str, list[str]]:
+        relevant_paths = self._extract_contract_path_line(internal_task, "Relevant existing paths:")
+        validation_paths = self._extract_contract_path_line(internal_task, "Relevant validation or entry-point paths:")
+        return {
+            "relevant_paths": relevant_paths,
+            "validation_paths": validation_paths,
+        }
+
+    def _extract_contract_path_line(self, internal_task: str, label: str) -> list[str]:
+        pattern = re.escape(label) + r"\s*(.+)"
+        match = re.search(pattern, internal_task, flags=re.IGNORECASE)
+        if not match:
+            return []
+        raw_value = match.group(1).strip()
+        if not raw_value or raw_value.lower() == "none":
+            return []
+        paths: list[str] = []
+        for item in raw_value.split(","):
+            candidate = self._normalize_candidate_path(item)
+            if candidate and candidate.lower() != "none" and candidate not in paths:
+                paths.append(candidate)
+        return paths[:8]
+
+    def _inject_contract_reads(
+        self,
+        *,
+        thread_id: str,
+        action_batch: CodingActionBatch,
+        internal_task: str,
+    ) -> CodingActionBatch:
+        actions = list(action_batch.actions)
+        if not any(action.action_type in {"make_directory", "create_file", "delete_path"} for action in actions):
+            return action_batch
+
+        contract_paths = self._extract_contract_paths(internal_task)
+        requested_paths = contract_paths["relevant_paths"] + contract_paths["validation_paths"]
+        if not requested_paths:
+            return action_batch
+
+        existing_paths: list[str] = []
+        for path in requested_paths:
+            try:
+                resolved = file_tools.resolve_workspace_path(thread_id, path)
+            except file_tools.WorkspaceSecurityError:
+                continue
+            if resolved.exists() and path not in existing_paths:
+                existing_paths.append(path)
+
+        if not existing_paths:
+            return action_batch
+
+        already_read = {
+            str(action.path)
+            for action in actions
+            if isinstance(action, ReadFileAction)
+        }
+        injected_reads = [
+            ReadFileAction(path=path)
+            for path in existing_paths
+            if path not in already_read
+        ]
+        if not injected_reads:
+            return action_batch
+        return CodingActionBatch(actions=[*injected_reads, *actions])
+
     def _build_self_check(
         self,
         thread_id: str,
         executed: list[CodingActionResult],
         blocked: list[CodingActionResult],
         approval_request: dict | None,
+        internal_task: str,
     ) -> dict:
+        contract_paths = self._extract_contract_paths(internal_task)
+        contract_relevant_paths = contract_paths["relevant_paths"]
+        contract_validation_paths = contract_paths["validation_paths"]
         inspected_files: list[dict] = []
         touched_paths: list[str] = []
         for result in executed:
@@ -667,11 +741,19 @@ class CodingAgent:
                 }
             )
 
+        inspected_paths = [str(item.get("path", "")).strip() for item in inspected_files if str(item.get("path", "")).strip()]
+        contract_paths_inspected = [path for path in contract_relevant_paths if path in inspected_paths]
+        validation_paths_inspected = [path for path in contract_validation_paths if path in inspected_paths]
+
         follow_up: list[str] = []
         if blocked:
             follow_up.append("Resolve the blocked step before expanding the implementation scope.")
         if approval_request is not None:
             follow_up.append("Runtime validation is still pending user approval.")
+        if contract_relevant_paths and not contract_paths_inspected:
+            follow_up.append("Relevant files from the manager step contract were not re-read during this step.")
+        if contract_validation_paths and not validation_paths_inspected:
+            follow_up.append("Validation or entry-point files from the manager step contract were not inspected during this step.")
 
         created_python_files = [
             result.target
@@ -689,6 +771,10 @@ class CodingAgent:
             summary_parts.append(f"Inspected files after execution: {preview_paths}.")
         else:
             summary_parts.append("No file contents were re-read after execution.")
+        if contract_paths_inspected:
+            summary_parts.append("Contract-aligned reads: " + ", ".join(contract_paths_inspected[:4]) + ".")
+        if validation_paths_inspected:
+            summary_parts.append("Validation-context reads: " + ", ".join(validation_paths_inspected[:4]) + ".")
         if follow_up:
             summary_parts.append("Follow-up: " + " ".join(follow_up[:3]))
         else:
@@ -697,6 +783,10 @@ class CodingAgent:
         return {
             "inspected_files": inspected_files,
             "touched_paths": touched_paths,
+            "contract_relevant_paths": contract_relevant_paths,
+            "contract_validation_paths": contract_validation_paths,
+            "contract_paths_inspected": contract_paths_inspected,
+            "validation_paths_inspected": validation_paths_inspected,
             "follow_up": follow_up,
             "summary": " ".join(summary_parts).strip(),
         }
@@ -875,7 +965,7 @@ Return JSON only with this shape:
 
     def _infer_file_content(self, user_task: str, filename: str) -> str:
         content_match = re.search(
-            r"(?:mit dem inhalt|inhalt|with content|content)\s+(.+?)(?:,?\s+und\s+beantrage.*|$)",
+            r"(?:mit dem inhalt|inhalt|with content|content)\s+(.+?)(?:,?\s+(?:und\s+beantrage|and\s+(?:request|run|execute)).*|$)",
             user_task,
             flags=re.IGNORECASE | re.DOTALL,
         )
@@ -893,6 +983,8 @@ Return JSON only with this shape:
             r"(?:unterordner|ordner|verzeichnis)\s+([a-zA-Z0-9_./-]+)",
             r"(?:in|im|unter)\s+([a-zA-Z0-9_./-]+)\s+ordner",
             r"(?:in|im|unter)\s+([a-zA-Z0-9_./-]+)",
+            r"(?:subfolder|folder|directory)\s+(?:named\s+)?([a-zA-Z0-9_./-]+)",
+            r"(?:in|under)\s+([a-zA-Z0-9_./-]+)\s+(?:folder|directory)",
         ]
         for pattern in patterns:
             match = re.search(pattern, user_task, flags=re.IGNORECASE)
@@ -938,7 +1030,7 @@ Return JSON only with this shape:
 
     def _extract_read_target(self, user_task: str) -> str | None:
         match = re.search(
-            r"(?:lies|öffne|zeige).*?([a-zA-Z0-9_./-]+\.[a-zA-Z0-9]+)",
+            r"(?:lies|öffne|oeffne|zeige|read|open|show).*?([a-zA-Z0-9_./-]+\.[a-zA-Z0-9]+)",
             user_task,
             flags=re.IGNORECASE,
         )
@@ -972,6 +1064,12 @@ Return JSON only with this shape:
                 "anschließend ausführen",
                 "ausführung beantragen",
                 "bitte ausführen",
+                "request the execution",
+                "request execution",
+                "then run",
+                "afterward run",
+                "execute it",
+                "run it",
                 "starte ",
                 "führe ",
                 "ausführen",

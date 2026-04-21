@@ -168,9 +168,14 @@ class ReviewerAgent:
                 "source": "ollama",
                 "model": self.model,
                 "summary": parsed["summary"],
+                "verdict": parsed["verdict"],
+                "definition_of_done_met": parsed["definition_of_done_met"],
+                "project_status": parsed["project_status"],
                 "findings": parsed["findings"],
                 "assumptions": parsed["assumptions"],
                 "open_questions": parsed["open_questions"],
+                "repair_tasks": parsed["repair_tasks"],
+                "project_completion_notes": parsed["project_completion_notes"],
                 "recommendation": parsed["recommendation"],
                 "raw_response": raw_response,
             },
@@ -208,9 +213,14 @@ Internal worker task:
 Return JSON only with this shape:
 {{
   "summary": "short review summary",
+  "verdict": "done|needs_repair|blocked|unclear",
+  "definition_of_done_met": true,
+  "project_status": "in_progress|ready_for_validation|validated_ready_to_test|ready_to_test|project_done|unclear",
   "findings": ["concrete risk, flaw, or concern"],
   "assumptions": ["assumption or context gap"],
   "open_questions": ["question to resolve next"],
+  "repair_tasks": ["concrete follow-up coding task"],
+  "project_completion_notes": ["note about broader project state"],
   "recommendation": "best next step in the user's language",
   "user_reply": "compact user-facing review reply in the user's language"
 }}
@@ -227,9 +237,14 @@ Return JSON only with this shape:
             raise ValueError("Reviewer agent response is missing required fields.")
         return {
             "summary": summary,
+            "verdict": str(payload.get("verdict", "")).strip().lower() or "unclear",
+            "definition_of_done_met": self._normalize_bool(payload.get("definition_of_done_met")),
+            "project_status": self._normalize_project_status(payload.get("project_status")),
             "findings": self._normalize_list(payload.get("findings")),
             "assumptions": self._normalize_list(payload.get("assumptions")),
             "open_questions": self._normalize_list(payload.get("open_questions")),
+            "repair_tasks": self._normalize_list(payload.get("repair_tasks")),
+            "project_completion_notes": self._normalize_list(payload.get("project_completion_notes")),
             "recommendation": str(payload.get("recommendation", "")).strip(),
             "user_reply": user_reply,
         }
@@ -238,6 +253,38 @@ Return JSON only with this shape:
         if not isinstance(value, list):
             return []
         return [text for item in value if (text := str(item).strip())][:6]
+
+    def _normalize_bool(self, value: object) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "yes", "done", "met"}:
+                return True
+            if lowered in {"false", "no", "not_met", "needs_repair"}:
+                return False
+        return None
+
+    def _normalize_project_status(self, value: object) -> str:
+        lowered = str(value or "").strip().lower()
+        if not lowered:
+            return "unclear"
+        mapping = {
+            "in progress": "in_progress",
+            "in_progress": "in_progress",
+            "ready for validation": "ready_for_validation",
+            "ready_for_validation": "ready_for_validation",
+            "validation_ready": "ready_for_validation",
+            "validated ready to test": "validated_ready_to_test",
+            "validated_ready_to_test": "validated_ready_to_test",
+            "validated-ready-to-test": "validated_ready_to_test",
+            "ready to test": "ready_to_test",
+            "ready_to_test": "ready_to_test",
+            "ready-to-test": "ready_to_test",
+            "project done": "project_done",
+            "project_done": "project_done",
+        }
+        return mapping.get(lowered, lowered)
 
     def _error_result(self, thread_id: str, worker_task: str, user_language: str, exc: Exception) -> dict:
         code = getattr(exc, "code", "reviewer_llm_error")
@@ -295,6 +342,12 @@ Return JSON only with this shape:
         if payload["open_questions"]:
             title = "Offene Fragen" if user_language == "de" else "Open questions"
             sections.append(self._format_bullets(title, payload["open_questions"]))
+        if payload.get("repair_tasks"):
+            title = "Konkrete Reparaturschritte" if user_language == "de" else "Concrete repair tasks"
+            sections.append(self._format_bullets(title, payload["repair_tasks"]))
+        if payload.get("project_completion_notes"):
+            title = "Projektstatus" if user_language == "de" else "Project status"
+            sections.append(self._format_bullets(title, payload["project_completion_notes"]))
         if payload["recommendation"]:
             prefix = "Empfehlung" if user_language == "de" else "Recommendation"
             sections.append(f"{prefix}: {payload['recommendation']}")

@@ -2,6 +2,7 @@ from ai_hub.config import (
     MANAGER_MODEL,
     CODING_MODEL,
     RESEARCH_MODEL,
+    EXPLORER_MODEL,
     REVIEWER_MODEL,
 )
 
@@ -17,6 +18,8 @@ class ModelRouter:
             return CODING_MODEL
         if role == "research":
             return RESEARCH_MODEL
+        if role == "explorer":
+            return EXPLORER_MODEL
         if role == "reviewer":
             return REVIEWER_MODEL
 

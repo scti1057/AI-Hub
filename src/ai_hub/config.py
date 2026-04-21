@@ -37,6 +37,7 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 MANAGER_MODEL = os.getenv("MANAGER_MODEL", "gemma4:31b")
 CODING_MODEL = os.getenv("CODING_MODEL", "qwen3-coder:30b")
 RESEARCH_MODEL = os.getenv("RESEARCH_MODEL", "qwen3:30b")
+EXPLORER_MODEL = os.getenv("EXPLORER_MODEL", "devstral:24b")
 REVIEWER_MODEL = os.getenv(
     "REVIEWER_MODEL",
     "qwen3-coder:30b",

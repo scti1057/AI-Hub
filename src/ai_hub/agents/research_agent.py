@@ -8,6 +8,7 @@ from ai_hub.logging_config import log_event, setup_logging
 from ai_hub.llm.model_router import ModelRouter
 from ai_hub.llm.ollama_client import LLMServiceError, OllamaClient
 from ai_hub.memory.history import format_thread_history
+from ai_hub.memory.store import HubStore
 from ai_hub.tools.web_search import WebSearchClient, format_search_context
 
 
@@ -23,10 +24,12 @@ class ResearchAgent:
         language_policy: LanguagePolicy | None = None,
         client: OllamaClient | None = None,
         web_search: WebSearchClient | None = None,
+        store: HubStore | None = None,
     ) -> None:
         self.language_policy = language_policy or LanguagePolicy()
         self.client = client or OllamaClient()
         self.web_search = web_search or WebSearchClient()
+        self.store = store
         self.model = ModelRouter.get_model_for_role("research")
         self.system_prompt = self._load_system_prompt()
 
@@ -42,6 +45,7 @@ class ResearchAgent:
         worker_task = internal_task or language_context.internal_message
         web_context = "No web search used."
         search_payload = None
+        artifact_context = self._load_artifact_context(thread_id)
 
         try:
             if self._should_use_web_search(user_task, worker_task):
@@ -54,6 +58,9 @@ class ResearchAgent:
                 internal_task=worker_task,
                 user_language=language_context.user_language,
                 web_context=web_context,
+                artifact_memory=self._artifact_memory_block(artifact_context),
+                latest_change_memory=self._latest_change_block(artifact_context),
+                latest_review_memory=self._latest_review_block(artifact_context),
             )
             log_event(logger, "research_ollama_request", thread_id=thread_id, model=self.model)
             raw_response = self.client.generate(model=self.model, prompt=prompt, temperature=0.2)
@@ -88,6 +95,7 @@ class ResearchAgent:
                 "open_questions": parsed["open_questions"],
                 "recommendation": parsed["recommendation"],
                 "sources": self._serialize_sources(search_payload),
+                "artifact_context": artifact_context,
                 "raw_response": raw_response,
             },
         }
@@ -103,6 +111,9 @@ class ResearchAgent:
         internal_task: str,
         user_language: str,
         web_context: str,
+        artifact_memory: str,
+        latest_change_memory: str,
+        latest_review_memory: str,
     ) -> str:
         return f"""
 {self.system_prompt}
@@ -122,6 +133,15 @@ Original user task:
 
 Internal worker task:
 {internal_task}
+
+Stored project/artifact memory:
+{artifact_memory}
+
+Latest stored change snapshot:
+{latest_change_memory}
+
+Latest stored implementation review:
+{latest_review_memory}
 
 Web research context:
 {web_context}
@@ -208,6 +228,105 @@ Return JSON only with this shape:
             if text:
                 normalized.append(text)
         return normalized[:6]
+
+    def _load_artifact_context(self, thread_id: str) -> dict:
+        if self.store is None:
+            return {
+                "recent_artifacts": [],
+                "latest_change_snapshot": {},
+                "latest_review": {},
+            }
+
+        try:
+            artifacts = self.store.list_artifacts(thread_id)
+            latest_change = self.store.get_artifact(thread_id, "coding_change_snapshot")
+            latest_review = self.store.get_artifact(thread_id, "implementation_review")
+        except Exception:
+            return {
+                "recent_artifacts": [],
+                "latest_change_snapshot": {},
+                "latest_review": {},
+            }
+
+        preferred = (
+            "project_state",
+            "project_plan",
+            "project_brief",
+            "research_notes",
+            "review_notes",
+            "coding_step_contract",
+            "coding_change_snapshot",
+            "implementation_review",
+        )
+        artifact_map = {artifact["kind"]: artifact for artifact in artifacts}
+        recent_artifacts: list[dict] = []
+        for kind in preferred:
+            artifact = artifact_map.get(kind)
+            if artifact is None:
+                continue
+            recent_artifacts.append(
+                {
+                    "kind": artifact["kind"],
+                    "summary": str(artifact.get("summary", "")).strip(),
+                }
+            )
+
+        return {
+            "recent_artifacts": recent_artifacts[:8],
+            "latest_change_snapshot": (latest_change or {}).get("content", {}),
+            "latest_review": (latest_review or {}).get("content", {}),
+        }
+
+    def _artifact_memory_block(self, artifact_context: dict) -> str:
+        recent_artifacts = artifact_context.get("recent_artifacts") or []
+        if not recent_artifacts:
+            return "[no stored artifact memory available]"
+        return "\n".join(
+            f"- {item.get('kind', 'artifact')}: {item.get('summary', '') or '[no summary]'}"
+            for item in recent_artifacts[:8]
+        )
+
+    def _latest_change_block(self, artifact_context: dict) -> str:
+        latest_change = artifact_context.get("latest_change_snapshot") or {}
+        if not latest_change:
+            return "[no stored change snapshot available]"
+
+        lines = []
+        step_goal = str(latest_change.get("step_goal", "")).strip()
+        if step_goal:
+            lines.append(f"Step goal: {step_goal}")
+        summary = str(latest_change.get("summary", "")).strip()
+        if summary:
+            lines.append(f"Summary: {summary}")
+        review_verdict = str(latest_change.get("review_verdict", "")).strip()
+        if review_verdict:
+            lines.append(f"Review verdict: {review_verdict}")
+        for change in (latest_change.get("snapshot_changes") or [])[:6]:
+            path = str(change.get("path", "")).strip()
+            status = str(change.get("status", "")).strip()
+            if path and status:
+                lines.append(f"- {path}: {status}")
+        return "\n".join(lines) if lines else "[stored change snapshot is empty]"
+
+    def _latest_review_block(self, artifact_context: dict) -> str:
+        latest_review = artifact_context.get("latest_review") or {}
+        if not latest_review:
+            return "[no stored implementation review available]"
+
+        lines = []
+        summary = str(latest_review.get("summary", "")).strip()
+        if summary:
+            lines.append(f"Summary: {summary}")
+        payload = latest_review.get("internal_payload") or {}
+        verdict = str(payload.get("verdict", "")).strip()
+        if verdict:
+            lines.append(f"Verdict: {verdict}")
+        project_status = str(payload.get("project_status", "")).strip()
+        if project_status:
+            lines.append(f"Project status: {project_status}")
+        for item in (payload.get("repair_tasks") or [])[:4]:
+            lines.append(f"- Repair: {item}")
+        return "\n".join(lines) if lines else "[stored implementation review is empty]"
 
     def _error_result(self, thread_id: str, worker_task: str, user_language: str, exc: Exception) -> dict:
         code = getattr(exc, "code", "research_llm_error")

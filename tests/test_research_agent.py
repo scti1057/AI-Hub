@@ -75,6 +75,17 @@ class FakeSession:
         return FakeResponse({}, text="<html><body>Fetched page preview text.</body></html>")
 
 
+class FakeStore:
+    def __init__(self, artifacts: dict[str, dict]) -> None:
+        self.artifacts = artifacts
+
+    def list_artifacts(self, thread_id: str) -> list[dict]:
+        return list(self.artifacts.values())
+
+    def get_artifact(self, thread_id: str, kind: str) -> dict | None:
+        return self.artifacts.get(kind)
+
+
 def test_research_agent_uses_research_model_and_parses_llm_reply(monkeypatch, tmp_path):
     configure_paths(monkeypatch, tmp_path)
 
@@ -183,6 +194,69 @@ def test_research_agent_uses_web_search_context_when_available(monkeypatch, tmp_
     assert "Web research context:" in client.calls[0]["prompt"]
     assert "Official documentation snippet." in client.calls[0]["prompt"]
     assert result["internal_payload"]["sources"][0]["url"] == "https://example.com/docs"
+
+
+def test_research_agent_uses_stored_artifact_memory(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.agents.research_agent import ResearchAgent
+
+    client = FakeResearchClient(
+        """
+        {
+          "summary": "The stored project memory narrows the analysis.",
+          "findings": ["The last review still expects a repair on the route files."],
+          "assumptions": [],
+          "open_questions": ["Should the next step stay focused on the route repair?"],
+          "recommendation": "Keep the next implementation bounded to the known repair scope.",
+          "user_reply": "Ich habe die gespeicherte Projektmemory in die Analyse einbezogen."
+        }
+        """
+    )
+    store = FakeStore(
+        {
+            "project_state": {
+                "kind": "project_state",
+                "summary": "Project is in needs_repair phase.",
+                "content": {"phase": "needs_repair"},
+            },
+            "coding_change_snapshot": {
+                "kind": "coding_change_snapshot",
+                "summary": "1 modified",
+                "content": {
+                    "step_goal": "Repair the route files.",
+                    "summary": "1 modified",
+                    "review_verdict": "needs_repair",
+                    "snapshot_changes": [{"path": "src/app/page.tsx", "status": "modified"}],
+                },
+            },
+            "implementation_review": {
+                "kind": "implementation_review",
+                "summary": "The route still needs one focused repair.",
+                "content": {
+                    "summary": "The route still needs one focused repair.",
+                    "internal_payload": {
+                        "verdict": "needs_repair",
+                        "project_status": "in_progress",
+                        "repair_tasks": ["Fix the route variant mismatch."],
+                    },
+                },
+            },
+        }
+    )
+    agent = ResearchAgent(client=client, store=store)
+
+    result = agent.handle_task(
+        thread_id="thread-r-memory",
+        user_task="Bitte analysiere den naechsten sicheren Schritt.",
+        history=[],
+    )
+
+    assert result["status"] == "completed"
+    assert "Stored project/artifact memory:" in client.calls[0]["prompt"]
+    assert "Project is in needs_repair phase." in client.calls[0]["prompt"]
+    assert "Fix the route variant mismatch." in client.calls[0]["prompt"]
+    assert result["internal_payload"]["artifact_context"]["latest_change_snapshot"]["step_goal"] == "Repair the route files."
 
 
 def test_manager_routes_research_requests_to_research_agent(monkeypatch, tmp_path):

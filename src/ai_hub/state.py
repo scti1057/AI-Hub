@@ -21,6 +21,7 @@ class ManagerDecision(StrEnum):
     PLAN = "plan"
     CODING = "coding"
     RESEARCH = "research"
+    EXPLORER = "explorer"
     REVIEW = "review"
 
 

@@ -248,6 +248,69 @@ def test_coding_agent_skips_missing_integration_read_inside_mutating_batch(monke
     assert "Skipped read" in result["reply"] or "Lesen übersprungen" in result["reply"]
 
 
+def test_coding_agent_injects_contract_reads_before_mutation(monkeypatch, tmp_path):
+    file_tools = configure_workspace(monkeypatch, tmp_path)
+
+    from ai_hub.agents.coding_agent import CodingAgent
+    from ai_hub.schemas.coding_actions import CodingActionBatch, CreateFileAction
+
+    file_tools.write_file("thread-contract-reads", "src/main.py", "print('old')\n")
+    file_tools.write_file("thread-contract-reads", "tests/test_main.py", "def test_ok():\n    assert True\n")
+
+    agent = CodingAgent()
+    result = agent.handle_task(
+        thread_id="thread-contract-reads",
+        user_task="Implement the next bounded step.",
+        history=[],
+        internal_task=(
+            "Update src/app.py.\n"
+            "Relevant existing paths: src/main.py\n"
+            "Relevant validation or entry-point paths: tests/test_main.py"
+        ),
+        structured_plan=CodingActionBatch(
+            actions=[CreateFileAction(path="src/app.py", content="print('new')\n", content_inferred=False)]
+        ),
+    )
+
+    assert result["status"] == "completed"
+    executed_types = [(item["action_type"], item.get("target")) for item in result["actions_executed"]]
+    assert executed_types[:2] == [
+        ("read_file", "src/main.py"),
+        ("read_file", "tests/test_main.py"),
+    ]
+
+
+def test_coding_agent_self_check_reports_contract_alignment(monkeypatch, tmp_path):
+    file_tools = configure_workspace(monkeypatch, tmp_path)
+
+    from ai_hub.agents.coding_agent import CodingAgent
+    from ai_hub.schemas.coding_actions import CodingActionBatch, CreateFileAction
+
+    file_tools.write_file("thread-contract-self-check", "src/main.py", "print('old')\n")
+    file_tools.write_file("thread-contract-self-check", "tests/test_main.py", "def test_ok():\n    assert True\n")
+
+    agent = CodingAgent()
+    result = agent.handle_task(
+        thread_id="thread-contract-self-check",
+        user_task="Implement the next bounded step.",
+        history=[],
+        internal_task=(
+            "Update src/app.py.\n"
+            "Relevant existing paths: src/main.py\n"
+            "Relevant validation or entry-point paths: tests/test_main.py"
+        ),
+        structured_plan=CodingActionBatch(
+            actions=[CreateFileAction(path="src/app.py", content="print('new')\n", content_inferred=False)]
+        ),
+    )
+
+    self_check = result["internal_payload"]["self_check"]
+    assert self_check["contract_paths_inspected"] == ["src/main.py"]
+    assert self_check["validation_paths_inspected"] == ["tests/test_main.py"]
+    assert "Contract-aligned reads: src/main.py." in self_check["summary"]
+    assert "Validation-context reads: tests/test_main.py." in self_check["summary"]
+
+
 def test_coding_agent_normalizes_pytest_command_string_request(monkeypatch, tmp_path):
     file_tools = configure_workspace(monkeypatch, tmp_path)
 

@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import re
 from uuid import uuid4
@@ -32,6 +33,7 @@ from ai_hub.tools.code_runner import (
     execute_python_approval,
 )
 from ai_hub.tools.dependency_tools import analyze_workspace_dependencies
+from ai_hub.tools import file_tools
 from ai_hub.tools.file_tools import WorkspaceSecurityError
 from ai_hub.tools.push_notify import send_notification
 
@@ -90,6 +92,18 @@ PROJECT_CONTINUE_PATTERNS = (
     "einverstanden",
 )
 
+PROJECT_REPAIR_PATTERNS = (
+    "fix",
+    "repair",
+    "repar",
+    "debug",
+    "retry",
+    "nochmal",
+    "erneut",
+    "weiter",
+    "continue",
+)
+
 FULL_IMPLEMENTATION_PATTERNS = (
     "let me know when you are done",
     "let me know when the full implementation is done",
@@ -143,7 +157,7 @@ class ManagerWorkflow:
     ) -> None:
         self.store = store or HubStore()
         self.language_policy = LanguagePolicy()
-        self.delegation = DelegationService()
+        self.delegation = DelegationService(store=self.store)
         self.planner = planner or ManagerPlanner()
 
     def handle_chat(self, thread_id: str | None, user_message: str) -> dict:
@@ -977,6 +991,8 @@ class ManagerWorkflow:
             meta={"approval_request_id": approval_id, "execution_result": result},
         )
         follow_up = self._mark_autonomous_approval_outcome(approval["thread_id"], result)
+        if follow_up is None:
+            self._update_project_state_after_execution_approval(approval["thread_id"], result)
         if approval["status"] == ApprovalStatus.EXECUTED.value:
             continuation = self._continue_autonomous_run_after_approval(approval["thread_id"])
             if continuation is not None:
@@ -1328,6 +1344,14 @@ class ManagerWorkflow:
                 "Ich habe den letzten Coding-Schritt zusätzlich intern gegenprüfen lassen.",
                 "I also had the latest coding step checked internally.",
             )
+        repair_note = ""
+        repair_loop = internal_payload.get("repair_loop") or {}
+        if int(repair_loop.get("attempted") or 0) > 0:
+            repair_note = self.language_policy.user_text(
+                user_language,
+                f"Der Manager hat daraufhin noch {int(repair_loop.get('attempted') or 0)} fokussierte Reparatur-Schritte nachgeschoben.",
+                f"The manager then ran {int(repair_loop.get('attempted') or 0)} focused repair steps.",
+            )
         autonomous_note = ""
         autonomous_payload = internal_payload.get("autonomous_run") or {}
         if autonomous_payload.get("enabled"):
@@ -1346,11 +1370,11 @@ class ManagerWorkflow:
                     f"The manager executed multiple planned steps autonomously in this run ({len(completed)}/{len(total)} steps completed).",
                 )
         if status == "completed":
-            return "\n".join(part for part in (consultation_note, review_note, autonomous_note, manager_prefix, reply) if part).strip()
+            return "\n".join(part for part in (consultation_note, review_note, repair_note, autonomous_note, manager_prefix, reply) if part).strip()
         if status == "approval_required":
-            return "\n".join(part for part in (consultation_note, review_note, autonomous_note, manager_prefix, reply) if part).strip()
+            return "\n".join(part for part in (consultation_note, review_note, repair_note, autonomous_note, manager_prefix, reply) if part).strip()
         if status == "completed_with_approval":
-            return "\n".join(part for part in (consultation_note, review_note, autonomous_note, manager_prefix, reply) if part).strip()
+            return "\n".join(part for part in (consultation_note, review_note, repair_note, autonomous_note, manager_prefix, reply) if part).strip()
         return self.language_policy.user_text(
             user_language,
             f"Delegiert: {reason}\n{reply}",
@@ -1369,6 +1393,22 @@ class ManagerWorkflow:
         consultation: dict | None,
         pending_message_id: int | None = None,
     ) -> tuple[dict, dict | None]:
+        explorer_context = self._prepare_explorer_context(
+            thread_id=thread_id,
+            user_message=user_message,
+            history=history,
+            worker_task=worker_task,
+            user_language=user_language,
+            pending_message_id=pending_message_id,
+        )
+        step_contract = self._build_coding_step_contract(
+            user_message=user_message,
+            worker_task=worker_task,
+            coding_structured_plan=coding_structured_plan,
+            consultation=consultation,
+            explorer_context=explorer_context,
+        )
+        worker_task = self._augment_coding_task_with_contract(worker_task, step_contract)
         delegated_result = self.delegation.execute(
             ManagerDecision.CODING,
             thread_id,
@@ -1381,6 +1421,11 @@ class ManagerWorkflow:
             internal_payload = dict(delegated_result.get("internal_payload") or {})
             internal_payload["consultation"] = consultation
             delegated_result["internal_payload"] = internal_payload
+        internal_payload = dict(delegated_result.get("internal_payload") or {})
+        if explorer_context is not None:
+            internal_payload["explorer_context"] = explorer_context
+        internal_payload["step_contract"] = step_contract
+        delegated_result["internal_payload"] = internal_payload
         implementation_review = self._review_coding_result(
             thread_id=thread_id,
             user_message=user_message,
@@ -1407,6 +1452,129 @@ class ManagerWorkflow:
             implementation_review=implementation_review,
         )
         return delegated_result, implementation_review
+
+    def _should_attempt_repair_loop(
+        self,
+        delegated_result: dict,
+        implementation_review: dict | None,
+    ) -> bool:
+        if implementation_review is None:
+            return False
+        if delegated_result.get("status") != "completed":
+            return False
+        if delegated_result.get("approval_request") is not None:
+            return False
+        review_payload = implementation_review.get("internal_payload") or {}
+        verdict = str(review_payload.get("verdict", "")).strip().lower()
+        definition_of_done_met = review_payload.get("definition_of_done_met")
+        repair_tasks = review_payload.get("repair_tasks") or []
+        return bool(repair_tasks) and (verdict == "needs_repair" or definition_of_done_met is False)
+
+    def _build_repair_worker_task(
+        self,
+        *,
+        original_worker_task: str,
+        user_message: str,
+        delegated_result: dict,
+        implementation_review: dict,
+        attempt_index: int,
+    ) -> str:
+        internal_payload = delegated_result.get("internal_payload") or {}
+        review_payload = implementation_review.get("internal_payload") or {}
+        step_contract = internal_payload.get("step_contract") or {}
+        repair_tasks = review_payload.get("repair_tasks") or []
+        findings = review_payload.get("findings") or []
+        return (
+            "Implement a focused repair step for the latest coding result. "
+            "Do not restart the feature. Only fix the concrete remaining issues below while preserving the current structure.\n\n"
+            f"Original user request: {user_message}\n"
+            f"Original coding task: {original_worker_task}\n"
+            f"Manager step goal: {step_contract.get('goal', '')}\n"
+            f"Manager definition of done: {step_contract.get('definition_of_done', [])}\n"
+            f"Latest coding summary: {delegated_result.get('internal_summary', '')}\n"
+            f"Reviewer verdict: {review_payload.get('verdict', '')}\n"
+            f"Reviewer findings: {findings}\n"
+            f"Concrete repair tasks: {repair_tasks}\n"
+            f"Repair attempt: {attempt_index}/{MANAGER_AUTONOMOUS_MAX_DEBUG_REPAIRS}\n\n"
+            "After the fixes, leave the step coherent and aligned with the existing definition of done."
+        ).strip()
+
+    def _run_manager_repair_loop(
+        self,
+        *,
+        thread_id: str,
+        user_message: str,
+        history: list[dict],
+        worker_task: str,
+        user_language: str,
+        consultation: dict | None,
+        delegated_result: dict,
+        implementation_review: dict | None,
+        pending_message_id: int | None = None,
+    ) -> tuple[dict, dict | None]:
+        if not self._should_attempt_repair_loop(delegated_result, implementation_review):
+            return delegated_result, implementation_review
+
+        repair_history: list[dict] = []
+        current_result = delegated_result
+        current_review = implementation_review
+
+        for attempt in range(1, MANAGER_AUTONOMOUS_MAX_DEBUG_REPAIRS + 1):
+            if not self._should_attempt_repair_loop(current_result, current_review):
+                break
+
+            if pending_message_id is not None:
+                self._update_pending_status(
+                    pending_message_id=pending_message_id,
+                    comment=self.language_policy.user_text(
+                        user_language,
+                        "Manager leitet einen fokussierten Reparatur-Schritt ein",
+                        "Manager is triggering a focused repair step",
+                    ),
+                )
+
+            repair_task = self._build_repair_worker_task(
+                original_worker_task=worker_task,
+                user_message=user_message,
+                delegated_result=current_result,
+                implementation_review=current_review,
+                attempt_index=attempt,
+            )
+            repair_result, repair_review = self._execute_coding_step(
+                thread_id=thread_id,
+                user_message=user_message,
+                history=history,
+                worker_task=repair_task,
+                coding_structured_plan=None,
+                user_language=user_language,
+                consultation=consultation,
+                pending_message_id=pending_message_id,
+            )
+            repair_payload = (repair_review or {}).get("internal_payload") or {}
+            repair_history.append(
+                {
+                    "attempt": attempt,
+                    "status": repair_result.get("status"),
+                    "review_verdict": repair_payload.get("verdict"),
+                    "definition_of_done_met": repair_payload.get("definition_of_done_met"),
+                    "repair_tasks": repair_payload.get("repair_tasks", []),
+                    "summary": repair_result.get("internal_summary", ""),
+                }
+            )
+            current_result = repair_result
+            current_review = repair_review
+            if current_result.get("status") in {"blocked", "error", "approval_required", "completed_with_approval"}:
+                break
+
+        repair_loop_payload = {
+            "attempted": len(repair_history),
+            "runs": repair_history,
+            "stopped_with_review": (current_review or {}).get("internal_payload", {}).get("verdict"),
+        }
+        internal_payload = dict(current_result.get("internal_payload") or {})
+        internal_payload["repair_loop"] = repair_loop_payload
+        current_result["internal_payload"] = internal_payload
+        return current_result, current_review
 
     def _apply_dependency_gate(
         self,
@@ -1960,6 +2128,17 @@ class ManagerWorkflow:
                 consultation=consultation,
                 pending_message_id=pending_message_id,
             )
+            delegated_result, implementation_review = self._run_manager_repair_loop(
+                thread_id=thread_id,
+                user_message=user_message,
+                history=history,
+                worker_task=worker_task,
+                user_language=user_language,
+                consultation=consultation,
+                delegated_result=delegated_result,
+                implementation_review=implementation_review,
+                pending_message_id=pending_message_id,
+            )
             self._update_project_state_after_coding(
                 thread_id=thread_id,
                 user_message=user_message,
@@ -2005,11 +2184,14 @@ class ManagerWorkflow:
 
     def _plan_safely(self, history_text: str, user_message: str, user_language: str) -> dict | None:
         try:
-            return self.planner.plan(
+            planning_note = self.planner.plan(
                 history_text=history_text,
                 user_message=user_message,
                 user_language=user_language,
             )
+            if not isinstance(planning_note, dict):
+                raise ValueError("Manager planner did not return a valid plan.")
+            return planning_note
         except Exception as exc:
             logger.warning("manager_planner_error error=%s", exc)
             return {
@@ -2058,6 +2240,9 @@ class ManagerWorkflow:
             "project_state",
             "project_plan",
             "project_brief",
+            "coding_step_contract",
+            "coding_change_snapshot",
+            "coding_context_snapshot",
             "coding_status",
             "implementation_review",
             "research_notes",
@@ -2199,6 +2384,95 @@ class ManagerWorkflow:
             return None
         return content
 
+    def _get_coding_status(self, thread_id: str) -> dict | None:
+        artifact = self.store.get_artifact(thread_id, "coding_status")
+        if artifact is None:
+            return None
+        content = artifact.get("content") or {}
+        if not isinstance(content, dict):
+            return None
+        return content
+
+    def _project_phase(self, project_state: dict | None) -> str:
+        if not isinstance(project_state, dict):
+            return ""
+        return str(project_state.get("phase", "")).strip().lower()
+
+    def _derive_validation_state(
+        self,
+        thread_id: str,
+        delegated_result: dict | None,
+        *,
+        current_state: dict | None = None,
+        execution_result: dict | None = None,
+    ) -> dict:
+        current = current_state or self._get_project_state(thread_id) or {}
+        project_plan = self._get_project_plan(thread_id) or {}
+        coding_status = self._get_coding_status(thread_id) or {}
+        delegated = delegated_result or {}
+        internal_payload = delegated.get("internal_payload") or {}
+        self_check = internal_payload.get("self_check") or coding_status.get("self_check") or {}
+        follow_up = [str(item).strip() for item in (self_check.get("follow_up") or []) if str(item).strip()]
+        follow_up_lower = [item.lower() for item in follow_up]
+
+        actions_executed = delegated.get("actions_executed")
+        if not isinstance(actions_executed, list) or not actions_executed:
+            actions_executed = current.get("last_actions_executed") or coding_status.get("actions_executed") or []
+
+        stored_execution = execution_result if isinstance(execution_result, dict) else current.get("last_execution_result")
+        validation_steps = project_plan.get("validation_steps") or []
+        execution_requested = any(item.get("action_type") == "request_execution" for item in actions_executed if isinstance(item, dict))
+        validation_pending = delegated.get("status") in {"approval_required", "completed_with_approval"} or any(
+            "pending user approval" in item for item in follow_up_lower
+        )
+        validation_missing = any("no runtime validation has been requested yet" in item for item in follow_up_lower)
+        validation_required = bool(validation_steps or execution_requested or validation_pending or validation_missing)
+
+        if isinstance(stored_execution, dict) and stored_execution:
+            returncode = stored_execution.get("returncode")
+            preview = stored_execution.get("preview") or ""
+            command = stored_execution.get("command")
+            if isinstance(command, list):
+                preview = preview or " ".join(str(part) for part in command)
+            if returncode == 0:
+                return {
+                    "required": bool(validation_required or validation_steps),
+                    "status": "passed",
+                    "summary": f"Latest validation run succeeded: {preview or 'approved execution'}",
+                }
+            if returncode is not None:
+                stderr = str(stored_execution.get("stderr") or "").strip()
+                detail = stderr.splitlines()[-1][:160] if stderr else "approved execution failed"
+                return {
+                    "required": True,
+                    "status": "failed",
+                    "summary": f"Latest validation run failed: {detail}",
+                }
+
+        if validation_pending:
+            return {
+                "required": True,
+                "status": "pending",
+                "summary": "Validation is pending user approval before the step can be considered ready to test.",
+            }
+        if validation_missing:
+            return {
+                "required": True,
+                "status": "not_requested",
+                "summary": "Validation is still missing for the latest implementation step.",
+            }
+        if validation_steps:
+            return {
+                "required": True,
+                "status": "not_run",
+                "summary": "Planned validation steps exist, but no successful execution result has been recorded yet.",
+            }
+        return {
+            "required": False,
+            "status": "not_needed",
+            "summary": "No explicit validation gate is currently recorded for this step.",
+        }
+
     def _should_resume_project_from_feedback(self, thread_id: str, user_message: str) -> bool:
         project_state = self._get_project_state(thread_id)
         if not project_state or not project_state.get("awaiting_user_feedback"):
@@ -2206,7 +2480,15 @@ class ManagerWorkflow:
         lowered = user_message.lower()
         if any(pattern in lowered for pattern in PLAN_REQUEST_PATTERNS):
             return False
-        return any(pattern in lowered for pattern in PROJECT_CONTINUE_PATTERNS)
+        if not any(pattern in lowered for pattern in PROJECT_CONTINUE_PATTERNS):
+            return False
+
+        phase = self._project_phase(project_state)
+        if phase in {"awaiting_approval", "ready_to_test"}:
+            return False
+        if phase == "blocked":
+            return any(pattern in lowered for pattern in PROJECT_REPAIR_PATTERNS)
+        return phase in {"planning", "implementation", "needs_repair", "blocked"}
 
     def _project_follow_up_worker_task(self, thread_id: str, user_message: str) -> str | None:
         if not self._should_resume_project_from_feedback(thread_id, user_message):
@@ -2222,7 +2504,19 @@ class ManagerWorkflow:
         latest_status = project_state.get("latest_status", "")
         phase = project_state.get("phase", "")
         ready_to_test = bool(project_state.get("ready_to_test"))
+        review_verdict = str(project_state.get("review_verdict", "")).strip().lower()
+        repair_tasks = project_state.get("repair_tasks") or []
+        project_completion_notes = project_state.get("project_completion_notes") or []
+        validation_status = str(project_state.get("validation_status", "")).strip().lower()
+        validation_summary = str(project_state.get("validation_summary", "")).strip()
         execution_context = self._execution_debug_context(project_state.get("last_execution_result"))
+        repair_note = ""
+        if phase == "needs_repair" or repair_tasks:
+            repair_note = (
+                f"\nOutstanding repair tasks: {repair_tasks}\n"
+                "Focus on these remaining issues before expanding scope."
+            )
+        completion_note = f"\nProject completion notes: {project_completion_notes}" if project_completion_notes else ""
         return (
             "Continue the active project using the previously approved plan. "
             "Implement only the next bounded step, keep the structure coherent, "
@@ -2232,12 +2526,17 @@ class ManagerWorkflow:
             f"Project phase: {phase}\n"
             f"Latest project status: {latest_status}\n"
             f"Ready to test: {ready_to_test}\n"
+            f"Latest review verdict: {review_verdict}\n"
+            f"Validation status: {validation_status or 'unknown'}\n"
+            f"Validation summary: {validation_summary or 'No explicit validation summary is stored yet.'}\n"
             f"Suggested repo structure: {repo_structure}\n"
             f"Completed steps: {completed_steps}\n"
             f"Remaining steps: {remaining_steps}\n"
             f"Suggested next steps: {next_steps}\n"
             f"Planned approach: {approach}\n"
             f"{execution_context}"
+            f"{repair_note}"
+            f"{completion_note}"
         ).strip()
 
     def _user_requests_full_implementation(self, user_message: str) -> bool:
@@ -2251,6 +2550,10 @@ class ManagerWorkflow:
         plan = self._llm_plan(planning_note)
         if plan is not None and plan.decision == "plan":
             return True
+        if plan is not None and plan.decision == "coding" and plan.coding_plan is not None:
+            actions = getattr(plan.coding_plan.actions, "actions", [])
+            if actions:
+                return False
         if self._has_explicit_workspace_action(user_message):
             return False
         if self._is_strategic_request(user_message) and sum(token in lowered for token in LARGE_CODING_PATTERNS) >= 1:
@@ -2360,6 +2663,199 @@ class ManagerWorkflow:
             f"Reviewer summary: {consultation.get('review_summary', '')}\n"
             "Implement only the smallest safe step that directly advances the task."
         ).strip()
+
+    def _prepare_explorer_context(
+        self,
+        *,
+        thread_id: str,
+        user_message: str,
+        history: list[dict],
+        worker_task: str,
+        user_language: str,
+        pending_message_id: int | None = None,
+    ) -> dict | None:
+        if pending_message_id is not None:
+            self._update_pending_status(
+                pending_message_id=pending_message_id,
+                comment=self.language_policy.user_text(
+                    user_language,
+                    "Explorer-Agent analysiert die relevante Repo-Struktur",
+                    "Explorer agent is analyzing the relevant repo structure",
+                ),
+            )
+
+        explorer_task = (
+            "Explore the current repository state for the next coding step. "
+            "Identify the smallest set of relevant existing files, summarize the current structure, "
+            "and recommend a step-local definition of done plus the best validation checks.\n\n"
+            f"Target coding step:\n{worker_task}"
+        )
+        explorer_result = self.delegation.execute(
+            ManagerDecision.EXPLORER,
+            thread_id,
+            user_message,
+            history,
+            internal_task=explorer_task,
+        )
+        if explorer_result.get("status") != "completed":
+            return None
+        payload = explorer_result.get("internal_payload") or {}
+        return {
+            "summary": explorer_result.get("internal_summary", ""),
+            "reply": explorer_result.get("reply", ""),
+            "repo_overview": payload.get("repo_overview", ""),
+            "relevant_paths": payload.get("relevant_paths", []),
+            "validation_relevant_paths": payload.get("validation_relevant_paths", []),
+            "suggested_definition_of_done": payload.get("suggested_definition_of_done", []),
+            "suggested_checks": payload.get("suggested_checks", []),
+            "risks": payload.get("risks", []),
+            "snapshots": payload.get("snapshots", []),
+        }
+
+    def _build_coding_step_contract(
+        self,
+        *,
+        user_message: str,
+        worker_task: str,
+        coding_structured_plan: CodingDelegationPlan | None,
+        consultation: dict | None,
+        explorer_context: dict | None,
+    ) -> dict:
+        definition_of_done = self._dedupe_items(
+            (explorer_context or {}).get("suggested_definition_of_done", [])
+            + (explorer_context or {}).get("suggested_checks", [])
+        )[:6]
+        if not definition_of_done:
+            definition_of_done = [
+                "Implement only the bounded step requested by the manager.",
+                "Keep the existing repository structure coherent.",
+                "Surface any unresolved validation risk instead of claiming completion.",
+            ]
+
+        return {
+            "owner": "manager",
+            "goal": (coding_structured_plan.summary if coding_structured_plan is not None else "") or worker_task,
+            "rationale": (coding_structured_plan.rationale if coding_structured_plan is not None else "") or "",
+            "definition_of_done": definition_of_done,
+            "relevant_paths": (explorer_context or {}).get("relevant_paths", [])[:8],
+            "validation_relevant_paths": (explorer_context or {}).get("validation_relevant_paths", [])[:8],
+            "repo_overview": (explorer_context or {}).get("repo_overview", ""),
+            "before_snapshots": (explorer_context or {}).get("snapshots", [])[:8],
+            "consultation_summary": self._dedupe_items(
+                [
+                    (consultation or {}).get("research_summary", ""),
+                    (consultation or {}).get("review_summary", ""),
+                ]
+            )[:3],
+            "user_request": user_message,
+        }
+
+    def _augment_coding_task_with_contract(self, worker_task: str, step_contract: dict) -> str:
+        relevant_paths = step_contract.get("relevant_paths") or []
+        validation_relevant_paths = step_contract.get("validation_relevant_paths") or []
+        before_snapshots = step_contract.get("before_snapshots") or []
+        dod_items = step_contract.get("definition_of_done") or []
+        repo_overview = step_contract.get("repo_overview", "")
+        snapshot_lines = []
+        for snapshot in before_snapshots[:4]:
+            path = str(snapshot.get("path", "")).strip()
+            preview = str(snapshot.get("preview", "")).strip()
+            if not path:
+                continue
+            snapshot_lines.append(f"- {path}: {preview[:220] or '[empty]'}")
+        relevant_summary = ", ".join(relevant_paths[:8]) if relevant_paths else "none"
+        validation_summary = ", ".join(validation_relevant_paths[:8]) if validation_relevant_paths else "none"
+        dod_summary = "\n".join(f"- {item}" for item in dod_items[:6]) if dod_items else "- Keep the step coherent."
+        before_summary = "\n".join(snapshot_lines) if snapshot_lines else "- No prior file previews captured."
+        return (
+            f"{worker_task}\n\n"
+            "Use this manager-owned step contract.\n"
+            f"Goal: {step_contract.get('goal', '')}\n"
+            f"Rationale: {step_contract.get('rationale', '')}\n"
+            f"Repo overview: {repo_overview}\n"
+            f"Relevant existing paths: {relevant_summary}\n"
+            f"Relevant validation or entry-point paths: {validation_summary}\n"
+            "Definition of done:\n"
+            f"{dod_summary}\n"
+            "Relevant file state before this step:\n"
+            f"{before_summary}\n"
+            "Adapt your implementation to this existing structure instead of starting from scratch."
+        ).strip()
+
+    def _capture_snapshot_for_paths(self, thread_id: str, paths: list[str]) -> list[dict]:
+        snapshots: list[dict] = []
+        for path in self._dedupe_items(paths)[:10]:
+            try:
+                content = file_tools.read_file(thread_id, path)
+            except Exception:
+                snapshots.append(
+                    {
+                        "path": path,
+                        "exists": False,
+                        "preview": "",
+                        "sha256": "",
+                    }
+                )
+                continue
+            snapshots.append(
+                {
+                    "path": path,
+                    "exists": True,
+                    "preview": content[:400],
+                    "bytes": len(content.encode("utf-8")),
+                    "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16],
+                }
+            )
+        return snapshots
+
+    def _build_snapshot_changes(self, before_snapshots: list[dict], after_snapshots: list[dict]) -> list[dict]:
+        before_map = {str(item.get("path", "")).strip(): item for item in before_snapshots if str(item.get("path", "")).strip()}
+        after_map = {str(item.get("path", "")).strip(): item for item in after_snapshots if str(item.get("path", "")).strip()}
+        ordered_paths = self._dedupe_items(list(before_map.keys()) + list(after_map.keys()))
+        changes: list[dict] = []
+
+        for path in ordered_paths:
+            before = before_map.get(path) or {}
+            after = after_map.get(path) or {}
+            before_exists = bool(before.get("exists", False))
+            after_exists = bool(after.get("exists", False))
+            before_sha = str(before.get("sha256", "")).strip()
+            after_sha = str(after.get("sha256", "")).strip()
+            status = "unchanged"
+            if not before_exists and after_exists:
+                status = "created"
+            elif before_exists and not after_exists:
+                status = "deleted"
+            elif before_exists and after_exists and before_sha and after_sha and before_sha != after_sha:
+                status = "modified"
+
+            changes.append(
+                {
+                    "path": path,
+                    "status": status,
+                    "before_exists": before_exists,
+                    "after_exists": after_exists,
+                    "before_sha256": before_sha,
+                    "after_sha256": after_sha,
+                }
+            )
+        return changes[:10]
+
+    def _snapshot_change_summary(self, snapshot_changes: list[dict]) -> str:
+        created = sum(1 for item in snapshot_changes if item.get("status") == "created")
+        modified = sum(1 for item in snapshot_changes if item.get("status") == "modified")
+        deleted = sum(1 for item in snapshot_changes if item.get("status") == "deleted")
+        unchanged = sum(1 for item in snapshot_changes if item.get("status") == "unchanged")
+        parts: list[str] = []
+        if created:
+            parts.append(f"{created} created")
+        if modified:
+            parts.append(f"{modified} modified")
+        if deleted:
+            parts.append(f"{deleted} deleted")
+        if unchanged and not parts:
+            parts.append(f"{unchanged} unchanged")
+        return ", ".join(parts) if parts else "no snapshot changes recorded"
 
     def _project_outline_from_memory(self, thread_id: str) -> dict | None:
         project_plan = self._get_project_plan(thread_id) or {}
@@ -2614,6 +3110,8 @@ class ManagerWorkflow:
 
         internal_payload = delegated_result.get("internal_payload") or {}
         self_check = internal_payload.get("self_check") or {}
+        step_contract = internal_payload.get("step_contract") or {}
+        explorer_context = internal_payload.get("explorer_context") or {}
         touched_paths = self._dedupe_items(self_check.get("touched_paths") or [])
         inspected_paths = self._dedupe_items(
             [str(item.get("path", "")).strip() for item in (self_check.get("inspected_files") or [])]
@@ -2627,6 +3125,14 @@ class ManagerWorkflow:
             [str(item.get("action_type", "")).strip() for item in actions_blocked]
         )
         primary_risks = self._dedupe_items(self_check.get("follow_up") or [])
+        validation_state = self._derive_validation_state(thread_id, delegated_result)
+        contract_definition_of_done = self._dedupe_items(step_contract.get("definition_of_done") or [])
+        contract_relevant_paths = self._dedupe_items(step_contract.get("relevant_paths") or [])
+        contract_validation_paths = self._dedupe_items(step_contract.get("validation_relevant_paths") or [])
+        before_snapshots = step_contract.get("before_snapshots") or explorer_context.get("snapshots") or []
+        review_paths = self._dedupe_items(contract_relevant_paths + contract_validation_paths + touched_paths + inspected_paths)
+        after_snapshots = self._capture_snapshot_for_paths(thread_id, review_paths)
+        snapshot_changes = self._build_snapshot_changes(before_snapshots, after_snapshots)
         touched_summary = ", ".join(touched_paths[:6]) if touched_paths else "No touched paths recorded."
         inspected_summary = ", ".join(inspected_paths[:6]) if inspected_paths else "No inspected files recorded."
         inspected_previews = []
@@ -2637,13 +3143,46 @@ class ManagerWorkflow:
                 continue
             inspected_previews.append(f"File: {path}\nPreview: {preview or '[empty]'}")
         inspected_preview_block = "\n\n".join(inspected_previews) if inspected_previews else "No file previews were captured."
+        before_snapshot_lines = []
+        for snapshot in before_snapshots[:6]:
+            path = str(snapshot.get("path", "")).strip()
+            preview = str(snapshot.get("preview", "")).strip()
+            exists = bool(snapshot.get("exists", True))
+            if not path:
+                continue
+            before_snapshot_lines.append(
+                f"Before: {path}\nExists: {exists}\nPreview: {preview or '[empty]'}"
+            )
+        before_snapshot_block = "\n\n".join(before_snapshot_lines) if before_snapshot_lines else "No before snapshots were captured."
+        after_snapshot_lines = []
+        for snapshot in after_snapshots[:6]:
+            path = str(snapshot.get("path", "")).strip()
+            preview = str(snapshot.get("preview", "")).strip()
+            exists = bool(snapshot.get("exists", False))
+            if not path:
+                continue
+            after_snapshot_lines.append(
+                f"After: {path}\nExists: {exists}\nPreview: {preview or '[empty]'}"
+            )
+        after_snapshot_block = "\n\n".join(after_snapshot_lines) if after_snapshot_lines else "No after snapshots were captured."
+        snapshot_change_block = "\n".join(
+            f"- {item['path']}: {item['status']}"
+            for item in snapshot_changes
+            if item.get("status") != "unchanged"
+        ) or "No material snapshot changes were detected."
         executed_summary = ", ".join(executed_action_types[:6]) if executed_action_types else "none"
         blocked_summary = ", ".join(blocked_action_types[:6]) if blocked_action_types else "none"
         review_task = (
             "Review the latest coding step as a critical implementation reviewer. "
-            "Use the implementation summary and short file previews below to identify likely bugs, import/runtime risks, missing validation, "
-            "signs that the step is too large, and the single best next check.\n\n"
+            "Use the manager-owned step contract, the before/after file state, and the implementation summary below to determine "
+            "whether the step is actually done, whether the definition of done is met, and which concrete repair tasks remain if it is not. "
+            "Also distinguish clearly between bounded step completion and the broader project status.\n\n"
             f"Original user request: {user_message}\n"
+            f"Manager step goal: {step_contract.get('goal', '')}\n"
+            f"Manager step rationale: {step_contract.get('rationale', '')}\n"
+            f"Relevant existing paths: {', '.join(contract_relevant_paths[:8]) if contract_relevant_paths else 'none'}\n"
+            f"Relevant validation or entry-point paths: {', '.join(contract_validation_paths[:8]) if contract_validation_paths else 'none'}\n"
+            f"Step definition of done: {contract_definition_of_done[:6] if contract_definition_of_done else 'none'}\n"
             f"Coding status: {delegated_result.get('status')}\n"
             f"Coding summary: {delegated_result.get('internal_summary', '')}\n"
             f"Self-check summary: {self_check.get('summary', '')}\n"
@@ -2651,12 +3190,21 @@ class ManagerWorkflow:
             f"Blocked action types: {blocked_summary}\n"
             f"Touched paths: {touched_summary}\n"
             f"Inspected files: {inspected_summary}\n"
-            f"File previews:\n{inspected_preview_block}\n"
+            f"Self-check previews:\n{inspected_preview_block}\n"
+            f"Relevant file state before the step:\n{before_snapshot_block}\n"
+            f"Relevant file state after the step:\n{after_snapshot_block}\n"
+            f"Observed snapshot changes:\n{snapshot_change_block}\n"
             f"Known follow-up risks: {primary_risks[:4] if primary_risks else 'none'}\n\n"
+            f"Manager validation required: {validation_state['required']}\n"
+            f"Manager validation status: {validation_state['status']}\n"
+            f"Manager validation summary: {validation_state['summary']}\n\n"
             "Review goals:\n"
+            "- State whether the definition of done is met.\n"
             "- Call out the highest-risk gap in the step.\n"
+            "- Recommend concrete repair tasks if the step is not done.\n"
+            "- State whether the overall project is in progress, ready for validation, validated and ready to test, or actually complete.\n"
             "- Say whether additional validation is needed before expanding scope.\n"
-            "- Recommend the next best check or test.\n"
+            "- If validation has not passed yet, prefer `ready_for_validation` over `validated_ready_to_test`.\n"
             "- Highlight obvious import, runtime, or integration problems if the previews strongly suggest them.\n"
             "- Stay concise and actionable."
         )
@@ -2727,6 +3275,13 @@ class ManagerWorkflow:
             "summary": review_result.get("internal_summary", ""),
             "reply": review_result.get("reply", ""),
             "status": review_result.get("status"),
+            "internal_payload": {
+                **(review_result.get("internal_payload") or {}),
+                "before_snapshots": before_snapshots[:8],
+                "after_snapshots": after_snapshots[:8],
+                "snapshot_changes": snapshot_changes,
+                "snapshot_change_summary": self._snapshot_change_summary(snapshot_changes),
+            },
         }
 
     def _store_delegation_artifacts(
@@ -2779,6 +3334,8 @@ class ManagerWorkflow:
         internal_summary = delegated_result.get("internal_summary", "") or ""
         if decision == ManagerDecision.CODING:
             dependency_check = internal_payload.get("dependency_check") or {}
+            step_contract = internal_payload.get("step_contract") or {}
+            explorer_context = internal_payload.get("explorer_context") or {}
             self.store.upsert_artifact(
                 thread_id=thread_id,
                 kind="coding_status",
@@ -2794,6 +3351,39 @@ class ManagerWorkflow:
                     "dependency_check": dependency_check,
                 },
             )
+            if step_contract:
+                self.store.upsert_artifact(
+                    thread_id=thread_id,
+                    kind="coding_step_contract",
+                    title="Coding Step Contract",
+                    summary=step_contract.get("goal", "") or "Latest manager-owned coding step contract.",
+                    content=step_contract,
+                )
+            if explorer_context:
+                self.store.upsert_artifact(
+                    thread_id=thread_id,
+                    kind="coding_context_snapshot",
+                    title="Coding Context Snapshot",
+                    summary=explorer_context.get("summary", "") or "Latest explorer snapshot before coding.",
+                    content=explorer_context,
+                )
+            if implementation_review is not None:
+                review_payload = implementation_review.get("internal_payload") or {}
+                self.store.upsert_artifact(
+                    thread_id=thread_id,
+                    kind="coding_change_snapshot",
+                    title="Coding Change Snapshot",
+                    summary=review_payload.get("snapshot_change_summary", "") or "Latest before/after coding snapshot.",
+                    content={
+                        "user_message": user_message,
+                        "step_goal": step_contract.get("goal", "") if step_contract else "",
+                        "summary": review_payload.get("snapshot_change_summary", ""),
+                        "review_verdict": review_payload.get("verdict", ""),
+                        "before_snapshots": review_payload.get("before_snapshots", []),
+                        "after_snapshots": review_payload.get("after_snapshots", []),
+                        "snapshot_changes": review_payload.get("snapshot_changes", []),
+                    },
+                )
             if dependency_check:
                 self.store.upsert_artifact(
                     thread_id=thread_id,
@@ -2813,6 +3403,8 @@ class ManagerWorkflow:
                         "status": implementation_review.get("status"),
                         "reply": implementation_review.get("reply", ""),
                         "summary": implementation_review.get("summary", ""),
+                        "project_status": (implementation_review.get("internal_payload") or {}).get("project_status"),
+                        "internal_payload": implementation_review.get("internal_payload", {}),
                     },
                 )
             return
@@ -2870,23 +3462,51 @@ class ManagerWorkflow:
     ) -> None:
         status = delegated_result.get("status")
         current = self._get_project_state(thread_id) or {}
+        review_payload = (implementation_review or {}).get("internal_payload") or {}
+
+        project_status = str(review_payload.get("project_status", "")).strip().lower()
+        review_verdict = str(review_payload.get("verdict", "")).strip().lower()
+        definition_of_done_met = review_payload.get("definition_of_done_met")
+        repair_tasks = self._dedupe_items(review_payload.get("repair_tasks") or [])[:4]
+        project_completion_notes = self._dedupe_items(review_payload.get("project_completion_notes") or [])[:4]
+        validation_state = self._derive_validation_state(thread_id, delegated_result, current_state=current)
+        validation_required = bool(validation_state["required"])
+        validation_status = validation_state["status"]
+        validation_summary = validation_state["summary"]
         phase = "implementation"
         awaiting_user_feedback = True
         if status in {"approval_required", "completed_with_approval"}:
             phase = "awaiting_approval"
             awaiting_user_feedback = False
-        elif status in {"blocked", "error"}:
+        elif status in {"blocked", "error"} or review_verdict == "blocked":
             phase = "blocked"
+            awaiting_user_feedback = True
+        elif review_verdict == "needs_repair" or definition_of_done_met is False or repair_tasks:
+            phase = "needs_repair"
             awaiting_user_feedback = True
 
         next_steps = self._dedupe_items(
-            [
+            repair_tasks
+            + project_completion_notes
+            + ([validation_summary] if validation_required and validation_status != "passed" else [])
+            + [
                 (implementation_review or {}).get("summary", ""),
                 (consultation or {}).get("review_summary", ""),
                 (consultation or {}).get("research_summary", ""),
             ]
         )[:3]
         summary = delegated_result.get("internal_summary", "") or current.get("last_summary", "") or "Latest coding step processed."
+        ready_to_test = bool(
+            project_status in {"ready_to_test", "validated_ready_to_test", "project_done"}
+            and status == "completed"
+            and review_verdict not in {"blocked", "needs_repair"}
+            and not repair_tasks
+            and definition_of_done_met is not False
+            and (not validation_required or validation_status == "passed")
+        )
+        if ready_to_test:
+            phase = "ready_to_test"
+            awaiting_user_feedback = True
         self.store.upsert_artifact(
             thread_id=thread_id,
             kind="project_state",
@@ -2896,16 +3516,92 @@ class ManagerWorkflow:
                 "phase": phase,
                 "awaiting_user_feedback": awaiting_user_feedback,
                 "autonomous_mode": False,
-                "ready_to_test": False,
+                "ready_to_test": ready_to_test,
                 "last_user_request": user_message,
                 "last_summary": summary,
                 "latest_status": status,
+                "review_project_status": project_status,
+                "review_verdict": review_verdict,
+                "definition_of_done_met": definition_of_done_met,
+                "repair_tasks": repair_tasks,
+                "project_completion_notes": project_completion_notes,
+                "validation_required": validation_required,
+                "validation_status": validation_status,
+                "validation_summary": validation_summary,
                 "next_steps": next_steps,
                 "remaining_steps": next_steps,
                 "completed_steps": [],
                 "pending_step": None,
                 "last_actions_executed": delegated_result.get("actions_executed", []),
                 "last_actions_blocked": delegated_result.get("actions_blocked", []),
+                "last_execution_result": current.get("last_execution_result"),
+            },
+        )
+
+    def _update_project_state_after_execution_approval(self, thread_id: str, result: dict) -> None:
+        current = self._get_project_state(thread_id)
+        if not current or current.get("autonomous_mode"):
+            return
+
+        coding_status = self._get_coding_status(thread_id) or {}
+        delegated_result = {
+            "status": current.get("latest_status"),
+            "actions_executed": current.get("last_actions_executed", []),
+            "actions_blocked": current.get("last_actions_blocked", []),
+            "internal_payload": {
+                "self_check": coding_status.get("self_check", {}),
+            },
+        }
+        validation_state = self._derive_validation_state(
+            thread_id,
+            delegated_result,
+            current_state=current,
+            execution_result=result,
+        )
+        validation_required = bool(validation_state["required"])
+        validation_status = validation_state["status"]
+        validation_summary = validation_state["summary"]
+
+        if result.get("returncode") == 0:
+            ready_to_test = bool(
+                current.get("review_project_status") in {"ready_to_test", "validated_ready_to_test", "project_done"}
+                and current.get("review_verdict") not in {"blocked", "needs_repair"}
+                and not (current.get("repair_tasks") or [])
+                and (not validation_required or validation_status == "passed")
+            )
+            next_steps = self._dedupe_items(
+                (current.get("project_completion_notes") or [])
+                + ([] if ready_to_test else ["Continue with the next bounded implementation or validation step."])
+            )[:3]
+            phase = "ready_to_test" if ready_to_test else "implementation"
+            latest_status = "executed"
+            summary = "Approved execution completed successfully."
+        else:
+            ready_to_test = False
+            next_steps = self._dedupe_items(
+                [validation_summary] + (current.get("repair_tasks") or []) + (current.get("project_completion_notes") or [])
+            )[:3]
+            phase = "blocked"
+            latest_status = "failed"
+            summary = "Approved execution failed."
+
+        self.store.upsert_artifact(
+            thread_id=thread_id,
+            kind="project_state",
+            title="Project State",
+            summary=summary,
+            content={
+                **current,
+                "phase": phase,
+                "awaiting_user_feedback": True,
+                "ready_to_test": ready_to_test,
+                "latest_status": latest_status,
+                "validation_required": validation_required,
+                "validation_status": validation_status,
+                "validation_summary": validation_summary,
+                "next_steps": next_steps,
+                "remaining_steps": next_steps,
+                "last_execution_result": result,
             },
         )
 

@@ -57,6 +57,10 @@ Use the word "steps", not "slices", when you describe implementation sequencing.
 Recent thread context:
 {history_text}
 
+The recent thread context may include a "Project memory" section summarizing stored artifacts.
+Treat that section as grounded project state and prefer it over re-inventing context from scratch.
+When project memory mentions review findings, repair tasks, change snapshots, or current phase, keep your route and plan aligned with that state.
+
 New user message:
 {user_message}
 

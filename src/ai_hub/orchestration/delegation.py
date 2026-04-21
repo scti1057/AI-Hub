@@ -2,9 +2,11 @@ import logging
 
 from ai_hub.language_policy import LanguagePolicy
 from ai_hub.agents.coding_agent import CodingAgent
+from ai_hub.agents.explorer_agent import ExplorerAgent
 from ai_hub.agents.research_agent import ResearchAgent
 from ai_hub.agents.reviewer_agent import ReviewerAgent
 from ai_hub.logging_config import log_event, setup_logging
+from ai_hub.memory.store import HubStore
 from ai_hub.schemas.coding_delegation import CodingDelegationPlan
 from ai_hub.state import ManagerDecision
 
@@ -14,10 +16,11 @@ setup_logging()
 
 
 class DelegationService:
-    def __init__(self) -> None:
+    def __init__(self, store: HubStore | None = None) -> None:
         self.language_policy = LanguagePolicy()
         self.coding_agent = CodingAgent(language_policy=self.language_policy)
-        self.research_agent = ResearchAgent()
+        self.explorer_agent = ExplorerAgent(language_policy=self.language_policy, store=store)
+        self.research_agent = ResearchAgent(store=store)
         self.reviewer_agent = ReviewerAgent()
 
     def execute(
@@ -56,6 +59,16 @@ class DelegationService:
             return result
         if decision == ManagerDecision.RESEARCH:
             result = self.research_agent.handle_task(thread_id, user_task, history, internal_task=internal_task)
+            log_event(
+                logger,
+                "delegation_execute_completed",
+                thread_id=thread_id,
+                decision=decision.value,
+                status=result.get("status"),
+            )
+            return result
+        if decision == ManagerDecision.EXPLORER:
+            result = self.explorer_agent.handle_task(thread_id, user_task, history, internal_task=internal_task)
             log_event(
                 logger,
                 "delegation_execute_completed",
