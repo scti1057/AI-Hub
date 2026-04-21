@@ -202,6 +202,26 @@ def test_coding_agent_self_check_flags_missing_runtime_validation(monkeypatch, t
     assert any("runtime validation" in item.lower() for item in self_check["follow_up"])
 
 
+def test_coding_agent_rejects_placeholder_only_empty_python_structured_plan(monkeypatch, tmp_path):
+    configure_workspace(monkeypatch, tmp_path)
+
+    from ai_hub.agents.coding_agent import CodingAgent
+    from ai_hub.schemas.coding_actions import CodingActionBatch, CreateFileAction
+
+    agent = CodingAgent()
+    result = agent.handle_task(
+        thread_id="thread-empty-python-plan",
+        user_task="Please implement src/main.py.",
+        history=[],
+        structured_plan=CodingActionBatch(
+            actions=[CreateFileAction(path="src/main.py", content="", content_inferred=True)]
+        ),
+    )
+
+    assert result["status"] == "error"
+    assert "placeholder-only empty file writes" in result["reply"] or "placeholder-only empty file writes" in result["internal_payload"]["error"]["message"]
+
+
 def test_coding_agent_keeps_explicit_missing_read_blocked(monkeypatch, tmp_path):
     configure_workspace(monkeypatch, tmp_path)
 

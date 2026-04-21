@@ -4,8 +4,9 @@ import re
 import shlex
 from pathlib import Path
 
+from ai_hub.config import CODING_DEBUG_LOG_MAX_CHARS, CODING_DEBUG_LOG_PROMPTS
 from ai_hub.language_policy import LanguagePolicy
-from ai_hub.logging_config import log_event, setup_logging
+from ai_hub.logging_config import log_event, log_text_block, setup_logging
 from ai_hub.llm.model_router import ModelRouter
 from ai_hub.llm.ollama_client import LLMServiceError, OllamaClient
 from ai_hub.schemas.coding_delegation import CodingDelegationPlan
@@ -142,6 +143,29 @@ class CodingAgent:
             approval_request=execution_result["approval_request"],
             user_language=language_context.user_language,
         )
+
+    def _intentionally_empty_file(self, path: str) -> bool:
+        normalized = str(path or "").strip().lower()
+        if not normalized:
+            return False
+        filename = normalized.rsplit("/", 1)[-1]
+        return filename in {"__init__.py", ".gitkeep", ".keep"}
+
+    def _validate_structured_action_batch(self, action_batch: CodingActionBatch) -> None:
+        invalid_paths: list[str] = []
+        for action in action_batch.actions:
+            if not isinstance(action, CreateFileAction):
+                continue
+            if self._intentionally_empty_file(action.path):
+                continue
+            if str(action.content or "").strip():
+                continue
+            invalid_paths.append(str(action.path))
+        if invalid_paths:
+            raise ValueError(
+                "Structured coding plan contains placeholder-only empty file writes for: "
+                + ", ".join(invalid_paths[:4])
+            )
 
     def _execute_action_batch(
         self,
@@ -762,6 +786,15 @@ class CodingAgent:
         ]
         if created_python_files and approval_request is None:
             follow_up.append("No runtime validation has been requested yet for the changed Python files.")
+        empty_created_files = [
+            item["path"]
+            for item in inspected_files
+            if item["path"] in created_python_files and int(item.get("bytes") or 0) == 0
+        ]
+        if empty_created_files:
+            follow_up.append(
+                "The created Python files are still empty, so the requested implementation is not present yet."
+            )
         if not executed and not blocked:
             follow_up.append("No concrete workspace mutation happened in this step.")
 
@@ -799,9 +832,40 @@ class CodingAgent:
         user_task: str,
         internal_task: str | None = None,
     ) -> CodingActionBatch | None:
-        prompt = self._build_llm_prompt(user_task=user_task, internal_task=internal_task or user_task)
-        log_event(logger, "coding_ollama_request", model=self.model)
+        worker_task = internal_task or user_task
+        prompt = self._build_llm_prompt(user_task=user_task, internal_task=worker_task)
+        log_event(
+            logger,
+            "coding_ollama_request",
+            model=self.model,
+            prompt_chars=len(prompt),
+            user_task_chars=len(user_task),
+            internal_task_chars=len(worker_task),
+            internal_task_preview=worker_task[:160],
+        )
+        if CODING_DEBUG_LOG_PROMPTS:
+            log_text_block(
+                logger,
+                "coding_prompt_body",
+                prompt,
+                max_chars=CODING_DEBUG_LOG_MAX_CHARS,
+                model=self.model,
+            )
         response = self.client.generate(model=self.model, prompt=prompt, temperature=0.1)
+        log_event(
+            logger,
+            "coding_generate_completed",
+            model=self.model,
+            raw_response_chars=len(response),
+        )
+        if CODING_DEBUG_LOG_PROMPTS:
+            log_text_block(
+                logger,
+                "coding_raw_response",
+                response,
+                max_chars=CODING_DEBUG_LOG_MAX_CHARS,
+                model=self.model,
+            )
         return self._parse_llm_action_batch(response)
 
     def _resolve_action_batch(
@@ -813,10 +877,12 @@ class CodingAgent:
         if isinstance(structured_plan, CodingDelegationPlan):
             batch = structured_plan.actions
             if batch.actions:
+                self._validate_structured_action_batch(batch)
                 return batch, True, False, True
             raise ValueError("Structured coding plan is empty.")
         if isinstance(structured_plan, CodingActionBatch):
             if structured_plan.actions:
+                self._validate_structured_action_batch(structured_plan)
                 return structured_plan, True, False, True
             raise ValueError("Structured coding action batch is empty.")
         llm_batch = self.build_action_batch_from_llm(user_task, internal_task=internal_task)

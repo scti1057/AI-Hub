@@ -208,7 +208,10 @@ def _target_run_log_files(logger_name: str) -> list[str]:
     if logger_name.startswith(
         (
             "ai_hub.orchestration.workflow",
+            "ai_hub.orchestration.delegation",
             "ai_hub.llm.manager_planner",
+            "ai_hub.llm.ollama_client",
+            "ai_hub.agents.explorer_agent",
             "ai_hub.agents.reviewer_agent",
             "ai_hub.agents.research_agent",
             "ai_hub.agents.coding_agent",
@@ -217,6 +220,8 @@ def _target_run_log_files(logger_name: str) -> list[str]:
         targets.append("exchange.log")
     if logger_name.startswith(("ai_hub.orchestration.workflow", "ai_hub.llm.manager_planner")):
         targets.append("manager.log")
+    if logger_name.startswith("ai_hub.agents.explorer_agent"):
+        targets.append("explorer.log")
     if logger_name.startswith("ai_hub.agents.reviewer_agent"):
         targets.append("reviewer.log")
     if logger_name.startswith("ai_hub.agents.research_agent"):

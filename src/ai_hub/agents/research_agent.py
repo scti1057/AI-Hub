@@ -1,10 +1,12 @@
+import hashlib
 import json
 import logging
 import re
 from pathlib import Path
 
+from ai_hub.config import RESEARCH_DEBUG_LOG_MAX_CHARS, RESEARCH_DEBUG_LOG_PROMPTS
 from ai_hub.language_policy import LanguagePolicy
-from ai_hub.logging_config import log_event, setup_logging
+from ai_hub.logging_config import log_event, log_text_block, setup_logging
 from ai_hub.llm.model_router import ModelRouter
 from ai_hub.llm.ollama_client import LLMServiceError, OllamaClient
 from ai_hub.memory.history import format_thread_history
@@ -59,13 +61,65 @@ class ResearchAgent:
                 user_language=language_context.user_language,
                 web_context=web_context,
                 artifact_memory=self._artifact_memory_block(artifact_context),
+                latest_constraints_memory=self._latest_constraints_block(artifact_context),
                 latest_change_memory=self._latest_change_block(artifact_context),
                 latest_review_memory=self._latest_review_block(artifact_context),
             )
-            log_event(logger, "research_ollama_request", thread_id=thread_id, model=self.model)
+            prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+            log_event(
+                logger,
+                "research_ollama_request",
+                thread_id=thread_id,
+                model=self.model,
+                history_chars=len(summary),
+                worker_task_chars=len(worker_task),
+                prompt_chars=len(prompt),
+                prompt_digest=prompt_digest,
+                worker_task_preview=worker_task[:160],
+                used_web_search=bool(search_payload),
+            )
+            if RESEARCH_DEBUG_LOG_PROMPTS:
+                log_text_block(
+                    logger,
+                    "research_prompt_body",
+                    prompt,
+                    max_chars=RESEARCH_DEBUG_LOG_MAX_CHARS,
+                    thread_id=thread_id,
+                    model=self.model,
+                    prompt_digest=prompt_digest,
+                )
             raw_response = self.client.generate(model=self.model, prompt=prompt, temperature=0.2)
+            log_event(
+                logger,
+                "research_generate_completed",
+                thread_id=thread_id,
+                model=self.model,
+                prompt_digest=prompt_digest,
+                raw_response_chars=len(raw_response),
+            )
+            if RESEARCH_DEBUG_LOG_PROMPTS:
+                log_text_block(
+                    logger,
+                    "research_raw_response",
+                    raw_response,
+                    max_chars=RESEARCH_DEBUG_LOG_MAX_CHARS,
+                    thread_id=thread_id,
+                    model=self.model,
+                    prompt_digest=prompt_digest,
+                )
             parsed = self._parse_response(raw_response)
             reply = self._render_reply(parsed, language_context.user_language)
+            log_event(
+                logger,
+                "research_ollama_response",
+                thread_id=thread_id,
+                model=self.model,
+                prompt_digest=prompt_digest,
+                summary_chars=len(parsed["summary"]),
+                findings_count=len(parsed["findings"]),
+                open_questions_count=len(parsed["open_questions"]),
+                reply_chars=len(reply),
+            )
         except Exception as exc:
             log_event(
                 logger,
@@ -112,6 +166,7 @@ class ResearchAgent:
         user_language: str,
         web_context: str,
         artifact_memory: str,
+        latest_constraints_memory: str,
         latest_change_memory: str,
         latest_review_memory: str,
     ) -> str:
@@ -136,6 +191,9 @@ Internal worker task:
 
 Stored project/artifact memory:
 {artifact_memory}
+
+Confirmed user constraints and decisions:
+{latest_constraints_memory}
 
 Latest stored change snapshot:
 {latest_change_memory}
@@ -233,6 +291,7 @@ Return JSON only with this shape:
         if self.store is None:
             return {
                 "recent_artifacts": [],
+                "manager_constraints": {},
                 "latest_change_snapshot": {},
                 "latest_review": {},
             }
@@ -244,6 +303,7 @@ Return JSON only with this shape:
         except Exception:
             return {
                 "recent_artifacts": [],
+                "manager_constraints": {},
                 "latest_change_snapshot": {},
                 "latest_review": {},
             }
@@ -251,6 +311,8 @@ Return JSON only with this shape:
         preferred = (
             "project_state",
             "project_plan",
+            "manager_constraints",
+            "change_request_brief",
             "project_brief",
             "research_notes",
             "review_notes",
@@ -273,6 +335,7 @@ Return JSON only with this shape:
 
         return {
             "recent_artifacts": recent_artifacts[:8],
+            "manager_constraints": ((self.store.get_artifact(thread_id, "manager_constraints") or {}).get("content", {})),
             "latest_change_snapshot": (latest_change or {}).get("content", {}),
             "latest_review": (latest_review or {}).get("content", {}),
         }
@@ -307,6 +370,23 @@ Return JSON only with this shape:
             if path and status:
                 lines.append(f"- {path}: {status}")
         return "\n".join(lines) if lines else "[stored change snapshot is empty]"
+
+    def _latest_constraints_block(self, artifact_context: dict) -> str:
+        constraints = artifact_context.get("manager_constraints") or {}
+        if not constraints:
+            return "[no stored user constraints available]"
+        lines = []
+        for item in (constraints.get("confirmed_directives") or [])[:6]:
+            lines.append(f"- {item}")
+        if constraints.get("forbid_dependency_install"):
+            lines.append("- Do not install dependencies unless the user explicitly changes that.")
+        if constraints.get("forbid_pytest"):
+            lines.append("- Do not run pytest unless the user explicitly changes that.")
+        if constraints.get("forbid_validation_execution"):
+            lines.append("- Do not request or run validation executions unless the user explicitly changes that.")
+        if constraints.get("stop_after_step"):
+            lines.append("- Stop after the current bounded step and report back before continuing.")
+        return "\n".join(lines) if lines else "[stored user constraints are empty]"
 
     def _latest_review_block(self, artifact_context: dict) -> str:
         latest_review = artifact_context.get("latest_review") or {}

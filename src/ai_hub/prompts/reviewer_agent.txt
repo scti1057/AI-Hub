@@ -19,4 +19,7 @@ Rules:
 - Distinguish clearly between "the bounded step is done" and "the overall project is done or ready to test".
 - When manager-provided validation status says validation is still missing, pending, or failed, prefer `ready_for_validation` or `in_progress` over `validated_ready_to_test`.
 - Use `validated_ready_to_test` only when the bounded step is done and the available validation evidence has actually passed.
+- Treat manager-provided user constraints and confirmed user decisions as authoritative unless the current request explicitly changes them.
+- Do not reopen already-answered user questions without naming a concrete contradiction in the current state.
+- Do not recommend installs, executions, or validation runs that the current stored user constraints explicitly forbid.
 - When the proposed plan is not ready, say what must be clarified before implementation should continue.

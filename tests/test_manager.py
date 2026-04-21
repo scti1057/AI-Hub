@@ -194,6 +194,28 @@ def test_manager_creates_thread_and_persists_messages(monkeypatch, tmp_path):
     assert messages[1]["agent"] == "manager"
 
 
+def test_manager_planning_context_includes_confirmed_constraints(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+
+    store = HubStore()
+    thread = store.ensure_thread(None)
+    workflow = ManagerWorkflow(store=store, planner=DeterministicPlanner())
+
+    workflow._store_manager_constraints(
+        thread["id"],
+        "Use automatic integer task IDs starting at 1. Do not run pytest yet.",
+    )
+
+    context = workflow._build_planning_context(thread["id"], [], limit=6)
+
+    assert "Confirmed user constraints:" in context
+    assert "Use automatic integer task IDs starting at 1." in context
+    assert "Do not run pytest until the user explicitly allows it." in context
+
+
 def test_manager_step_contract_carries_validation_paths_into_coding_task(monkeypatch, tmp_path):
     configure_paths(monkeypatch, tmp_path)
 
@@ -201,9 +223,11 @@ def test_manager_step_contract_carries_validation_paths_into_coding_task(monkeyp
     from ai_hub.orchestration.workflow import ManagerWorkflow
 
     store = HubStore()
+    thread = store.ensure_thread(None)
     workflow = ManagerWorkflow(store=store, planner=DeterministicPlanner())
 
     step_contract = workflow._build_coding_step_contract(
+        thread_id=thread["id"],
         user_message="Implement the next bounded step.",
         worker_task="Update src/main.py.",
         coding_structured_plan=None,
@@ -221,6 +245,7 @@ def test_manager_step_contract_carries_validation_paths_into_coding_task(monkeyp
     augmented_task = workflow._augment_coding_task_with_contract("Update src/main.py.", step_contract)
 
     assert step_contract["validation_relevant_paths"] == ["src/main.py", "tests/test_main.py"]
+    assert step_contract["request_kind"] == "implementation_step"
     assert "Relevant validation or entry-point paths: src/main.py, tests/test_main.py" in augmented_task
 
 
@@ -644,6 +669,249 @@ def test_manager_requests_dependency_install_for_missing_workspace_package(monke
     assert "requests" in dependency_status["content"]["missing_requirements"]
 
 
+def test_manager_skips_dependency_install_approval_when_user_forbids_it(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+    from ai_hub.tools.file_tools import write_file
+
+    store = HubStore()
+    workflow = ManagerWorkflow(store=store, planner=DeterministicPlanner())
+    thread = store.ensure_thread(None)
+    write_file(thread["id"], "src/main.py", "import requests\n")
+    store.upsert_artifact(
+        thread_id=thread["id"],
+        kind="manager_constraints",
+        title="Manager Constraints",
+        summary="Do not install dependencies yet.",
+        content={
+            "confirmed_directives": ["Do not install dependencies yet."],
+            "forbid_dependency_install": True,
+        },
+    )
+    workflow.delegation.coding_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "File created: `src/main.py`.",
+            "user_reply": "File created: `src/main.py`.",
+            "internal_summary": "Executed actions: create_file. Blocked actions: none. Approval request created: no.",
+            "actions_executed": [{"action_type": "create_file", "target": "src/main.py"}],
+            "actions_blocked": [],
+            "workspace": str(tmp_path / "workspaces" / thread["id"]),
+            "internal_payload": {
+                "language": "en",
+                "thread_id": thread["id"],
+                "task": "Create src/main.py.",
+                "self_check": {
+                    "inspected_files": [],
+                    "touched_paths": ["src/main.py"],
+                    "follow_up": [],
+                    "summary": "Inspected files after execution: src/main.py.",
+                },
+            },
+        }
+    )
+    workflow.delegation.reviewer_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Review reply",
+            "user_reply": "Review reply",
+            "internal_summary": "The bounded step is done.",
+            "internal_payload": {
+                "verdict": "done",
+                "definition_of_done_met": True,
+                "project_status": "ready_for_validation",
+                "repair_tasks": [],
+                "project_completion_notes": [],
+            },
+        }
+    )
+
+    result = workflow.handle_chat(thread_id=thread["id"], user_message="Please create src/main.py")
+
+    assert result["approval_request"] is None
+    assert "no package installation was prepared" in result["reply"].lower()
+
+
+def test_manager_suppresses_pytest_execution_approval_when_user_forbids_pytest(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+
+    store = HubStore()
+    workflow = ManagerWorkflow(store=store, planner=DeterministicPlanner())
+    thread = store.ensure_thread(None)
+    store.upsert_artifact(
+        thread_id=thread["id"],
+        kind="manager_constraints",
+        title="Manager Constraints",
+        summary="Do not run pytest yet.",
+        content={
+            "confirmed_directives": ["Do not run pytest yet."],
+            "forbid_pytest": True,
+        },
+    )
+    delegated_result = {
+        "status": "approval_required",
+        "reply": "Approval required: `python -m pytest tests/test_core.py` has been prepared.",
+        "user_reply": "Approval required: `python -m pytest tests/test_core.py` has been prepared.",
+        "internal_summary": "Executed actions: request_execution. Blocked actions: none. Approval request created: yes.",
+        "actions_executed": [{"action_type": "request_execution", "target": "tests/test_core.py"}],
+        "actions_blocked": [],
+        "workspace": str(tmp_path / "workspaces" / thread["id"]),
+        "approval_request": {
+            "tool_name": "request_python_execution",
+            "command": {
+                "thread_id": thread["id"],
+                "argv": ["-m", "pytest", "tests/test_core.py"],
+                "preview": "python -m pytest tests/test_core.py",
+                "rationale": "Run pytest.",
+            },
+            "rationale": "Run pytest.",
+            "user_message": "Approval required.",
+        },
+        "internal_payload": {
+            "language": "en",
+            "thread_id": thread["id"],
+            "task": "Run pytest.",
+            "self_check": {
+                "inspected_files": [],
+                "touched_paths": [],
+                "follow_up": [],
+                "summary": "Runtime validation is pending approval.",
+            },
+        },
+    }
+
+    constrained = workflow._enforce_manager_constraints_on_result(
+        thread_id=thread["id"],
+        user_message="Please continue with the current bounded step.",
+        delegated_result=delegated_result,
+        user_language="en",
+    )
+
+    assert constrained["approval_request"] is None
+    assert "no pytest run was prepared" in constrained["reply"].lower()
+
+
+def test_manager_does_not_auto_repair_when_user_requested_stop_after_step(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+
+    store = HubStore()
+    workflow = ManagerWorkflow(store=store, planner=DeterministicPlanner())
+    coding_worker = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "File created: `notes.txt`.",
+            "user_reply": "File created: `notes.txt`.",
+            "internal_summary": "Executed actions: create_file.",
+            "actions_executed": [{"action_type": "create_file", "target": "notes.txt"}],
+            "actions_blocked": [],
+            "workspace": str(tmp_path / "workspaces" / "thread"),
+            "internal_payload": {
+                "language": "en",
+                "thread_id": "ignored",
+                "task": "Create notes.txt.",
+                "self_check": {
+                    "inspected_files": [],
+                    "touched_paths": ["notes.txt"],
+                    "follow_up": [],
+                    "summary": "Inspected files after execution: notes.txt.",
+                },
+            },
+        }
+    )
+    review_worker = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Review reply",
+            "user_reply": "Review reply",
+            "internal_summary": "The step still needs one focused repair.",
+            "internal_payload": {
+                "verdict": "needs_repair",
+                "definition_of_done_met": False,
+                "project_status": "in_progress",
+                "repair_tasks": ["Add the missing newline."],
+                "project_completion_notes": [],
+            },
+        }
+    )
+    workflow.delegation.coding_agent = coding_worker
+    workflow.delegation.reviewer_agent = review_worker
+
+    result = workflow.handle_chat(
+        thread_id=None,
+        user_message="Please create notes.txt with the content hello, and stop after that step and report exactly what changed.",
+    )
+
+    assert result["route"] == "coding"
+    assert len(coding_worker.calls) == 1
+    assert "focused repair" not in result["reply"].lower()
+
+
+def test_manager_sanitizes_unsolicited_read_file_contents(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+
+    store = HubStore()
+    workflow = ManagerWorkflow(store=store, planner=DeterministicPlanner())
+    workflow.delegation.coding_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Contents of `src/main.py`:\nprint('secret')",
+            "user_reply": "Contents of `src/main.py`:\nprint('secret')",
+            "internal_summary": "Executed actions: read_file.",
+            "actions_executed": [
+                {
+                    "action_type": "read_file",
+                    "target": "src/main.py",
+                    "message": "Contents of `src/main.py`:\nprint('secret')",
+                }
+            ],
+            "actions_blocked": [],
+            "workspace": str(tmp_path / "workspaces" / "thread"),
+            "internal_payload": {
+                "language": "en",
+                "thread_id": "ignored",
+                "task": "Inspect src/main.py.",
+                "self_check": {
+                    "inspected_files": [{"path": "src/main.py", "preview": "print('secret')"}],
+                    "touched_paths": [],
+                    "follow_up": [],
+                    "summary": "Inspected files after execution: src/main.py.",
+                },
+            },
+        }
+    )
+    workflow.delegation.reviewer_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Review reply",
+            "user_reply": "Review reply",
+            "internal_summary": "The inspection is fine.",
+            "internal_payload": {
+                "verdict": "done",
+                "definition_of_done_met": True,
+                "project_status": "in_progress",
+                "repair_tasks": [],
+                "project_completion_notes": [],
+            },
+        }
+    )
+
+    result = workflow.handle_chat(thread_id=None, user_message="Please create src/main.py")
+
+    assert "print('secret')" not in result["reply"]
+    assert "Inspected file: `src/main.py`." in result["reply"]
+
+
 def test_manager_creates_nested_directory_and_file(monkeypatch, tmp_path):
     configure_paths(monkeypatch, tmp_path)
 
@@ -1036,6 +1304,160 @@ def test_manager_resumes_project_from_user_feedback(monkeypatch, tmp_path):
     assert "Continue the active project" in coding_worker.calls[0]["internal_task"]
     artifacts = {artifact["kind"]: artifact for artifact in store.list_artifacts(plan_result["thread"]["id"])}
     assert artifacts["project_state"]["content"]["phase"] == "implementation"
+
+
+def test_manager_rebases_follow_up_change_request_into_focused_step(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+    from ai_hub.schemas.manager_plan import ManagerPlan
+
+    class DirectPlanner:
+        def plan(self, history_text: str, user_message: str, user_language: str):
+            return {
+                "enabled": True,
+                "source": "ollama",
+                "plan": ManagerPlan(
+                    summary="Direct task.",
+                    decision="direct",
+                    reason="A direct reply would normally be enough.",
+                    user_reply="Direkte Antwort.",
+                    internal_task_for_worker="",
+                    approval_needed=False,
+                    coding_plan=None,
+                ),
+            }
+
+    store = HubStore()
+    workflow = ManagerWorkflow(store=store, planner=DirectPlanner())
+    thread = store.ensure_thread(None)
+    store.upsert_artifact(
+        thread_id=thread["id"],
+        kind="project_plan",
+        title="Project Plan",
+        summary="Stored tic-tac-toe plan.",
+        content={
+            "summary": "Stored tic-tac-toe plan.",
+            "steps": ["Implement the base game loop.", "Add the AI mode.", "Polish the GUI."],
+            "next_steps": ["Add the AI mode.", "Polish the GUI."],
+            "repo_structure": ["src/game.py", "src/ai.py", "src/gui.py"],
+        },
+    )
+    store.upsert_artifact(
+        thread_id=thread["id"],
+        kind="project_state",
+        title="Project State",
+        summary="Implementation is in progress.",
+        content={
+            "phase": "implementation",
+            "awaiting_user_feedback": True,
+            "autonomous_mode": False,
+            "ready_to_test": False,
+            "last_user_request": "Build tic-tac-toe",
+            "last_summary": "Implementation is in progress.",
+            "latest_status": "completed",
+            "review_project_status": "in_progress",
+            "review_verdict": "done",
+            "repair_tasks": [],
+            "project_completion_notes": [],
+            "next_steps": ["Add the AI mode.", "Polish the GUI."],
+            "remaining_steps": ["Add the AI mode.", "Polish the GUI."],
+            "completed_steps": ["Implement the base game loop."],
+            "pending_step": None,
+        },
+    )
+    store.upsert_artifact(
+        thread_id=thread["id"],
+        kind="coding_change_snapshot",
+        title="Coding Change Snapshot",
+        summary="1 modified",
+        content={
+            "step_goal": "Add the AI mode.",
+            "summary": "1 modified",
+            "review_verdict": "done",
+            "snapshot_changes": [{"path": "src/ai.py", "status": "modified"}],
+        },
+    )
+
+    workflow.delegation.explorer_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Explorer reply",
+            "user_reply": "Explorer reply",
+            "internal_summary": "Explorer summary",
+            "internal_payload": {
+                "repo_overview": "Tic-tac-toe is split into game, AI, and GUI modules.",
+                "relevant_paths": ["src/ai.py", "src/game.py", "src/gui.py"],
+                "validation_relevant_paths": ["src/ai.py", "tests/test_ai.py"],
+                "suggested_definition_of_done": ["The selected AI behavior is updated without changing unrelated UI code."],
+                "suggested_checks": ["Review the AI entry point and the focused test file."],
+                "snapshots": [],
+            },
+        }
+    )
+    workflow.delegation.coding_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Datei erstellt: `src/ai.py`.",
+            "user_reply": "Datei erstellt: `src/ai.py`.",
+            "internal_summary": "Executed actions: create_file.",
+            "actions_executed": [{"action_type": "create_file", "target": "src/ai.py"}],
+            "actions_blocked": [],
+            "workspace": str(tmp_path / "workspaces" / thread["id"]),
+            "internal_payload": {
+                "language": "de",
+                "thread_id": thread["id"],
+                "task": "Focused change request.",
+                "self_check": {
+                    "inspected_files": [{"path": "src/ai.py", "preview": "def choose_move(level):\n    return level\n", "bytes": 39}],
+                    "touched_paths": ["src/ai.py"],
+                    "follow_up": [],
+                    "summary": "Inspected files after execution: src/ai.py.",
+                },
+            },
+        }
+    )
+    workflow.delegation.reviewer_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Review reply",
+            "user_reply": "Review reply",
+            "internal_summary": "The bounded change is implemented, but validation still needs to run.",
+            "internal_payload": {
+                "verdict": "done",
+                "definition_of_done_met": True,
+                "project_status": "ready_for_validation",
+                "findings": [],
+                "assumptions": [],
+                "open_questions": [],
+                "repair_tasks": [],
+                "project_completion_notes": ["Run the focused AI validation next."],
+                "recommendation": "Run the focused AI validation next.",
+            },
+        }
+    )
+
+    result = workflow.handle_chat(
+        thread_id=thread["id"],
+        user_message="Bitte ändere jetzt nur den AI-Modus auf drei Schwierigkeitsstufen.",
+    )
+
+    assert result["route"] == "coding"
+    internal_task = workflow.delegation.coding_agent.calls[0]["internal_task"]
+    assert "Focused user change request" in internal_task
+    assert "Do not continue stale roadmap steps" in internal_task
+    assert "Continue the active project using the previously approved plan." not in internal_task
+
+    change_request_brief = store.get_artifact(thread["id"], "change_request_brief")
+    assert change_request_brief is not None
+    assert change_request_brief["content"]["request_kind"] == "change_request"
+    assert "AI-Modus" in change_request_brief["content"]["summary"]
+
+    step_contract = store.get_artifact(thread["id"], "coding_step_contract")
+    assert step_contract is not None
+    assert step_contract["content"]["request_kind"] == "change_request"
+    assert step_contract["content"]["relevant_paths"][0] == "src/ai.py"
 
 
 def test_manager_does_not_resume_coding_when_project_is_ready_to_test(monkeypatch, tmp_path):
@@ -2150,8 +2572,7 @@ def test_manager_full_implementation_followup_runs_autonomous_steps_from_stored_
     assert len(coding_worker.calls) >= 2
     assert "Current step 1 of" in coding_worker.calls[0]["internal_task"]
     assert "Current step 2 of" in coding_worker.calls[1]["internal_task"]
-    assert "ready for a first test run" in follow_up["reply"]
-    assert "Implemented steps:" in follow_up["reply"]
+    assert "ready-to-test state" in follow_up["reply"].lower()
 
 
 def test_manager_reviews_regular_coding_result_and_stores_self_check(monkeypatch, tmp_path):
@@ -2237,6 +2658,218 @@ def test_manager_reviews_regular_coding_result_and_stores_self_check(monkeypatch
     assert artifacts["coding_change_snapshot"]["content"]["snapshot_changes"][0]["path"] == "src/main.py"
 
 
+def test_manager_marks_read_only_coding_pass_as_analysis_only(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+    from ai_hub.schemas.manager_plan import ManagerPlan
+
+    class CodingPlanner:
+        def plan(self, history_text: str, user_message: str, user_language: str):
+            return {
+                "enabled": True,
+                "source": "ollama",
+                "plan": ManagerPlan(
+                    summary="Focused coding task.",
+                    decision="coding",
+                    reason="The user asked for a concrete code change.",
+                    user_reply="I will handle the code change.",
+                    internal_task_for_worker="Change src/main.py so it prints hello.",
+                    approval_needed=False,
+                    coding_plan=None,
+                ),
+            }
+
+    store = HubStore()
+    workflow = ManagerWorkflow(store=store, planner=CodingPlanner())
+    workflow.delegation.explorer_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Explorer reply",
+            "user_reply": "Explorer reply",
+            "internal_summary": "Explorer summary",
+            "internal_payload": {
+                "repo_overview": "Single-file Python app.",
+                "relevant_paths": ["src/main.py"],
+                "validation_relevant_paths": ["src/main.py"],
+                "suggested_definition_of_done": ["The greeting in src/main.py is updated."],
+                "suggested_checks": ["Verify the changed greeting in src/main.py."],
+                "snapshots": [],
+            },
+        }
+    )
+    workflow.delegation.coding_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Inspected file: `src/main.py`.",
+            "user_reply": "Inspected file: `src/main.py`.",
+            "internal_summary": "Executed actions: read_file.",
+            "actions_executed": [{"action_type": "read_file", "target": "src/main.py", "message": "Inspected file: `src/main.py`."}],
+            "actions_blocked": [],
+            "workspace": str(tmp_path / "workspaces" / "thread"),
+            "internal_payload": {
+                "language": "en",
+                "thread_id": "ignored",
+                "task": "Change src/main.py so it prints hello.",
+                "self_check": {
+                    "inspected_files": [{"path": "src/main.py", "preview": "print('old')\n", "bytes": 13}],
+                    "touched_paths": ["src/main.py"],
+                    "follow_up": [],
+                    "summary": "Inspected files after execution: src/main.py.",
+                },
+            },
+        }
+    )
+    workflow.delegation.reviewer_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Review reply",
+            "user_reply": "Review reply",
+            "internal_summary": "The step is done.",
+            "internal_payload": {
+                "verdict": "done",
+                "definition_of_done_met": True,
+                "project_status": "ready_to_test",
+                "findings": [],
+                "assumptions": [],
+                "open_questions": [],
+                "repair_tasks": [],
+                "project_completion_notes": [],
+                "recommendation": "Proceed.",
+            },
+        }
+    )
+
+    result = workflow.handle_chat(
+        thread_id=None,
+        user_message="Please change src/main.py so it prints hello.",
+    )
+
+    artifacts = {artifact["kind"]: artifact for artifact in store.list_artifacts(result["thread"]["id"])}
+    assert artifacts["coding_status"]["content"]["step_outcome"] == "analysis_only"
+    assert artifacts["project_state"]["content"]["step_outcome"] == "analysis_only"
+    assert artifacts["project_state"]["content"]["review_verdict"] == "needs_repair"
+    assert artifacts["project_state"]["content"]["ready_to_test"] is False
+    assert "analyzed the current state" in result["reply"].lower()
+
+
+def test_manager_builds_narrow_repair_worker_task(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+
+    workflow = ManagerWorkflow(store=HubStore(), planner=DeterministicPlanner())
+    repair_task = workflow._build_repair_worker_task(
+        original_worker_task="Build the entire tic-tac-toe project with GUI, AI, and all remaining polish steps.",
+        user_message="Please fix the AI difficulty switch.",
+        delegated_result={
+            "internal_summary": "Executed actions: create_file.",
+            "internal_payload": {
+                "self_check": {"touched_paths": ["src/ai.py"]},
+                "step_contract": {
+                    "goal": "Adjust the AI mode.",
+                    "request_kind": "change_request",
+                    "change_request_summary": "Change only the AI difficulty switch.",
+                    "relevant_paths": ["src/ai.py", "src/gui.py"],
+                    "validation_relevant_paths": ["tests/test_ai.py"],
+                    "failing_definition_of_done": ["The requested AI difficulty delta must be visible in src/ai.py."],
+                },
+            },
+        },
+        implementation_review={
+            "internal_payload": {
+                "verdict": "needs_repair",
+                "findings": ["The new difficulty switch is still missing."],
+                "repair_tasks": ["Add the missing hard-mode branch in src/ai.py."],
+                "snapshot_changes": [{"path": "src/ai.py", "status": "modified"}],
+            }
+        },
+        attempt_index=1,
+    )
+
+    assert "Original coding task:" not in repair_task
+    assert "Narrow repair paths: ['src/ai.py', 'src/gui.py', 'tests/test_ai.py']" in repair_task
+    assert "Failed definition-of-done items" in repair_task
+    assert "Add the missing hard-mode branch in src/ai.py." in repair_task
+
+
+def test_manager_blocks_coding_when_internal_review_fails(monkeypatch, tmp_path):
+    configure_paths(monkeypatch, tmp_path)
+
+    from ai_hub.memory.store import HubStore
+    from ai_hub.orchestration.workflow import ManagerWorkflow
+    from ai_hub.schemas.manager_plan import ManagerPlan
+
+    class ReviewGatedPlanner:
+        def plan(self, history_text: str, user_message: str, user_language: str):
+            return {
+                "enabled": True,
+                "source": "ollama",
+                "plan": ManagerPlan(
+                    summary="Implement the first bounded coding step after internal review.",
+                    decision="coding",
+                    reason="The user confirmed the first implementation step.",
+                    user_reply="I will start the first bounded step.",
+                    internal_task_for_worker="Implement the core game logic in game_logic.py.",
+                    approval_needed=False,
+                    coding_plan=None,
+                ),
+            }
+
+    store = HubStore()
+    workflow = ManagerWorkflow(store=store, planner=ReviewGatedPlanner())
+    workflow.delegation.research_agent = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Research reply",
+            "user_reply": "Research reply",
+            "internal_summary": "A bounded first step is feasible.",
+            "internal_payload": {
+                "summary": "A bounded first step is feasible.",
+                "findings": ["Start with game_logic.py."],
+                "assumptions": [],
+                "open_questions": [],
+                "recommendation": "Implement the core game logic first.",
+            },
+        }
+    )
+    workflow.delegation.reviewer_agent = RecordingWorker(
+        {
+            "status": "error",
+            "reply": "Reviewer agent error.",
+            "user_reply": "Reviewer agent error.",
+            "internal_summary": "Reviewer agent failed with reviewer_llm_error.",
+            "internal_payload": {
+                "error": {"code": "reviewer_llm_error"},
+            },
+        }
+    )
+    coding_worker = RecordingWorker(
+        {
+            "status": "completed",
+            "reply": "Should not run",
+            "user_reply": "Should not run",
+            "internal_summary": "Should not run",
+        }
+    )
+    workflow.delegation.coding_agent = coding_worker
+
+    result = workflow.handle_chat(
+        thread_id=None,
+        user_message="Please implement the first bounded tic-tac-toe coding step now.",
+    )
+
+    assert result["route"] == "coding"
+    assert len(coding_worker.calls) == 0
+    assert "internal review" in result["reply"].lower()
+    assert "do not want to execute the step blindly" in result["reply"].lower()
+    project_state = store.get_artifact(result["thread"]["id"], "project_state")
+    assert project_state is not None
+    assert project_state["content"]["phase"] == "blocked"
+
+
 def test_manager_skips_post_coding_review_for_empty_bootstrap_file(monkeypatch, tmp_path):
     configure_paths(monkeypatch, tmp_path)
 
@@ -2307,7 +2940,7 @@ def test_manager_skips_post_coding_review_for_empty_bootstrap_file(monkeypatch, 
     result = workflow.handle_chat(thread_id=None, user_message="Bitte lege src/main.py an.")
 
     assert result["route"] == "coding"
-    assert len(review_worker.calls) == 0
+    assert len(review_worker.calls) == 1
 
 
 def test_reset_thread_clears_thread_artifacts(monkeypatch, tmp_path):

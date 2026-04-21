@@ -220,6 +220,18 @@ def test_research_agent_uses_stored_artifact_memory(monkeypatch, tmp_path):
                 "summary": "Project is in needs_repair phase.",
                 "content": {"phase": "needs_repair"},
             },
+            "manager_constraints": {
+                "kind": "manager_constraints",
+                "summary": "Do not install dependencies or run pytest yet.",
+                "content": {
+                    "confirmed_directives": [
+                        "Use automatic integer task IDs starting at 1.",
+                        "Store the JSON file at the project root as tasks.json.",
+                    ],
+                    "forbid_dependency_install": True,
+                    "forbid_pytest": True,
+                },
+            },
             "coding_change_snapshot": {
                 "kind": "coding_change_snapshot",
                 "summary": "1 modified",
@@ -254,6 +266,8 @@ def test_research_agent_uses_stored_artifact_memory(monkeypatch, tmp_path):
 
     assert result["status"] == "completed"
     assert "Stored project/artifact memory:" in client.calls[0]["prompt"]
+    assert "Confirmed user constraints and decisions:" in client.calls[0]["prompt"]
+    assert "Use automatic integer task IDs starting at 1." in client.calls[0]["prompt"]
     assert "Project is in needs_repair phase." in client.calls[0]["prompt"]
     assert "Fix the route variant mismatch." in client.calls[0]["prompt"]
     assert result["internal_payload"]["artifact_context"]["latest_change_snapshot"]["step_goal"] == "Repair the route files."

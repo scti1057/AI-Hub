@@ -15,5 +15,8 @@ Rules:
 - Highlight what should be decided by the user before heavy implementation starts.
 - Produce output that can be stored as reusable project memory.
 - Use stored artifact memory and prior change/review snapshots as grounding when they are available, but prefer the current request and current workspace-derived reality when they conflict.
+- Treat stored confirmed user constraints and already-decided project details as authoritative unless the current request explicitly changes them.
+- Do not reopen questions the user already answered unless you can point to a concrete conflict in the stored state.
+- Do not recommend installs, executions, or validation runs that the stored user constraints currently forbid.
 - When web search context is available, use it carefully, cite sources conservatively, and distinguish snippets from inferred conclusions.
 - Prefer recommendations that help the manager come back to the user with a concrete proposal instead of vague analysis.

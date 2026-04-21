@@ -1,10 +1,16 @@
+import hashlib
 import json
 import logging
 import re
 from pathlib import Path
 
-from ai_hub.config import MANAGER_LLM_PLANNING_ENABLED, MANAGER_OLLAMA_ENABLED
-from ai_hub.logging_config import log_event, setup_logging
+from ai_hub.config import (
+    MANAGER_DEBUG_LOG_MAX_CHARS,
+    MANAGER_DEBUG_LOG_PROMPTS,
+    MANAGER_LLM_PLANNING_ENABLED,
+    MANAGER_OLLAMA_ENABLED,
+)
+from ai_hub.logging_config import log_event, log_text_block, setup_logging
 from ai_hub.llm.model_router import ModelRouter
 from ai_hub.llm.ollama_client import OllamaClient
 from ai_hub.schemas.manager_plan import ManagerPlan
@@ -53,6 +59,9 @@ When you choose decision="coding" for a bounded implementation step, prefer mean
 Only use empty file contents when the file is intentionally a placeholder such as an empty __init__.py.
 If the user asked for a project structure or a concrete first step, the coding_plan should create a coherent small implementation, not only comments or placeholder headings.
 Use the word "steps", not "slices", when you describe implementation sequencing.
+Treat explicit user prohibitions and confirmed implementation decisions from the current message or project memory as hard constraints.
+Do not propose dependency installs, pytest runs, execution requests, or automatic follow-on repairs when those constraints explicitly forbid them.
+Do not draft user-facing replies that dump raw file contents or large code blocks unless the user explicitly asked to inspect file contents.
 
 Recent thread context:
 {history_text}
@@ -112,10 +121,45 @@ Only include a non-empty coding_plan when decision="coding". Otherwise set codin
 Include project_outline when the request is a multi-file project, repo architecture task, or autonomous multi-step implementation. Otherwise set project_outline to null.
 """.strip()
 
-        log_event(logger, "manager_ollama_request", model=self.model)
+        prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+        log_event(
+            logger,
+            "manager_ollama_request",
+            model=self.model,
+            prompt_chars=len(prompt),
+            prompt_digest=prompt_digest,
+            history_chars=len(history_text),
+            user_message_chars=len(user_message),
+            user_language=user_language,
+        )
+        if MANAGER_DEBUG_LOG_PROMPTS:
+            log_text_block(
+                logger,
+                "manager_prompt_body",
+                prompt,
+                max_chars=MANAGER_DEBUG_LOG_MAX_CHARS,
+                model=self.model,
+                prompt_digest=prompt_digest,
+            )
         response = self.client.generate(model=self.model, prompt=prompt)
+        if MANAGER_DEBUG_LOG_PROMPTS:
+            log_text_block(
+                logger,
+                "manager_raw_response",
+                response,
+                max_chars=MANAGER_DEBUG_LOG_MAX_CHARS,
+                model=self.model,
+                prompt_digest=prompt_digest,
+            )
         plan = self._parse_plan(response)
-        log_event(logger, "manager_ollama_response", decision=plan.decision)
+        log_event(
+            logger,
+            "manager_ollama_response",
+            decision=plan.decision,
+            prompt_digest=prompt_digest,
+            response_chars=len(response),
+            summary_chars=len(plan.summary),
+        )
         return {
             "enabled": True,
             "source": "ollama",

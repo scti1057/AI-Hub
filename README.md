@@ -13,7 +13,7 @@ AI Hub is a local/private orchestration platform for:
 - a web-based chat interface
 - persistent thread-based conversations
 - a manager agent backed by Ollama
-- specialized coding, research, and review agents backed by Ollama
+- specialized coding, explorer, research, and review agents backed by Ollama
 - bounded worker delegation
 - step-based project planning and autonomous multi-step execution loops
 - approval-gated Python execution
@@ -36,7 +36,7 @@ The long-term vision is a usable private multi-agent assistant where:
 
 - the user primarily interacts with a manager agent
 - the manager maintains context across threads
-- coding, research, and review workers operate in specialized roles
+- coding, explorer, research, and review workers operate in specialized roles
 - risky actions require explicit human approval
 - local models via Ollama provide natural language planning and responses
 - the system remains safe enough to use from mobile devices
@@ -61,14 +61,19 @@ The following are implemented and testable today:
 - persistent thread/chat model in SQLite
 - manager workflow with Ollama and visible error reporting
 - coding delegation with structured internal actions
+- explorer delegation for repo/context snapshots before coding
 - research delegation with LLM-backed analytical output
 - review delegation with LLM-backed critical second-opinion output
 - thread-scoped project artifacts for reusable internal memory
 - manager-side project planning route for roadmap-first collaboration
 - manager-side pre-coding consultation via research and review for larger coding requests
 - autonomous manager loop over stored project steps with resume-from-state behavior
+- manager-owned coding step contracts with definition of done, relevant paths, validation paths, and before snapshots
 - coding self-check summaries after each action batch
-- post-coding implementation review by the reviewer agent when the slice is substantive enough
+- post-coding implementation review by the reviewer agent using manager-owned contracts plus before/after snapshots
+- coding change snapshots and implementation reviews stored as reusable artifacts
+- stored manager constraints extracted from user instructions and enforced against approvals and validation
+- explicit validation-state handling across coding, review, and approval flows
 - dependency audits against workspace imports, `requirements.txt`, and workspace `.venv`
 - provider-backed web search for the research agent with optional page previews
 - approval requests for Python execution
@@ -98,12 +103,17 @@ The following are implemented and testable today:
 - Natural user interaction
 - Thread-aware context handling
 - Compact project-memory reuse across turns
-- Routing between direct answer, project planning, coding delegation, research delegation, and review delegation
+- Routing between direct answer, project planning, coding delegation, explorer delegation, research delegation, and review delegation
 - Ollama-backed planning with explicit in-chat error feedback
 - Project-plan synthesis with repo structure, implementation steps, validation steps, and completion criteria
 - Project-state tracking across turns so follow-up feedback can resume the current implementation state instead of restarting
 - Autonomous multi-step execution with stop conditions such as `ready_to_test`, approval-required, and blocked/error
 - Internal research + review consultation before larger coding tasks
+- Explorer-backed repo/context snapshots before bounded coding steps
+- Manager-owned step contracts with goal, rationale, definition of done, relevant paths, validation paths, and before snapshots
+- Stored user constraints that can forbid dependency installs, pytest, validation execution, or automatic continuation after a step
+- Validation-state tracking such as `pending`, `passed`, `ready_for_validation`, and `validated_ready_to_test`
+- Repair-loop governance based on reviewer verdicts plus definition-of-done checks
 - External/web research via the research agent when configured
 - Aggregated progress and completion summaries built from the full autonomous run
 - Approval coordination
@@ -122,6 +132,7 @@ The following are implemented and testable today:
 - Multi-step action batches
 - Structured action results
 - Internal self-check summaries for touched files and obvious follow-up risks
+- Contract-aware file inspection using manager-provided relevant paths and validation / entry-point paths
 - Normalization of test-file execution requests to module-based test runs
 - Approval request creation only after the required file exists
 - LLM-driven action planning without silent heuristic fallback
@@ -133,6 +144,17 @@ The following are implemented and testable today:
 - Optional page-preview fetching for top web results
 - Source metadata returned in internal research payloads
 - Reusable research artifacts stored per thread
+- Access to compact artifact memory including stored constraints, latest coding contracts, change snapshots, and implementation reviews
+
+### Explorer capabilities
+
+- Read-only repo/context analysis before coding
+- Compact repo overview for the next bounded step
+- Relevant implementation-path selection
+- Relevant validation / entry-point path selection
+- Suggested definition-of-done items and checks for the next coding step
+- Before-step file snapshots stored for later review
+- Access to compact artifact memory including stored constraints, project state, latest coding contracts, change snapshots, and implementation reviews
 
 ### Execution capabilities
 
@@ -147,7 +169,7 @@ The following are implemented and testable today:
 
 ### High-level architecture
 
-`User -> Web App/API -> Manager Workflow -> Planning + Project Memory -> Optional Research/Review Consultation -> Worker Delegation -> Tools -> Approval/Execution`
+`User -> Web App/API -> Manager Workflow -> Planning + Project Memory + Stored Constraints -> Optional Research/Explorer/Review Consultation -> Manager-Owned Step Contract -> Worker Delegation -> Tools -> Approval/Execution`
 
 ### Main components
 
@@ -178,6 +200,9 @@ The manager runtime is implemented in [workflow.py](src/ai_hub/orchestration/wor
 - calling the Ollama-backed planner
 - validating and applying the structured planner result
 - consulting research and review workers before larger coding tasks
+- storing and reusing explicit user constraints and confirmed implementation decisions
+- calling the explorer worker before bounded coding steps when repo/context grounding is useful
+- building manager-owned coding step contracts from consultation + explorer context
 - delegating to workers
 - creating approval requests
 - surfacing LLM and orchestration errors back into the chat thread
@@ -202,6 +227,20 @@ Its execution pipeline is:
 
 The coding prompt is in [coding_agent.txt](src/ai_hub/prompts/coding_agent.txt).
 
+#### Explorer agent
+
+The explorer worker is implemented in [explorer_agent.py](src/ai_hub/agents/explorer_agent.py). It is read-only and prepares compact repo/context grounding before a bounded coding step.
+
+Its main outputs are:
+
+- a short repo overview
+- relevant implementation paths
+- relevant validation or entry-point paths
+- suggested definition-of-done items and checks
+- before-step file snapshots for later review
+
+The explorer prompt is in [explorer_agent.txt](src/ai_hub/prompts/explorer_agent.txt).
+
 #### Research agent
 
 The research worker is implemented in [research_agent.py](src/ai_hub/agents/research_agent.py). It uses its dedicated model to produce structured analytical output for comparisons, summaries, and open questions. It is read-only and does not touch the coding workspace.
@@ -210,6 +249,7 @@ When configured, it can enrich its prompt with provider-backed web search result
 #### Reviewer agent
 
 The review worker is implemented in [reviewer_agent.py](src/ai_hub/agents/reviewer_agent.py). It acts as a critical second opinion for plans, implementation ideas, and results. It is read-only and focuses on risks, gaps, regressions, and missing checks.
+For coding work, it reviews against the manager-owned step contract, before/after snapshots, and manager-derived validation state. Its structured output includes verdicts such as `done`, `needs_repair`, or `blocked`, whether the definition of done was met, concrete repair tasks, and a bounded-step vs. project-level status.
 
 #### Structured schemas
 
@@ -230,10 +270,15 @@ Current artifact categories include:
 - `project_brief`
 - `project_plan`
 - `project_state`
+- `manager_constraints`
 - `research_notes`
 - `web_research_notes`
 - `review_notes`
 - `coding_status`
+- `coding_step_contract`
+- `coding_context_snapshot`
+- `coding_change_snapshot`
+- `dependency_status`
 - `implementation_review`
 
 These artifacts are reused by the manager as compact planning context and are also exposed through the thread API.
@@ -277,6 +322,7 @@ The currently configured role-to-model mapping is:
 - manager: `gemma4:31b`
 - coding: `qwen3-coder:30b`
 - research: `qwen3:30b`
+- explorer: `devstral:24b`
 - reviewer: `qwen3-coder:30b`
 
 The backend still enforces safety, workspace limits, and approval rules independently of any model output.
@@ -301,29 +347,32 @@ Central logging configuration is in [logging_config.py](src/ai_hub/logging_confi
 9. For strategic or roadmap-style requests, the manager may switch into a dedicated planning route before coding starts.
 10. In that planning route, the manager consults the research and reviewer workers internally and comes back with a project proposal plus feedback questions.
 11. For larger coding requests, the manager may still consult the research and reviewer workers internally before choosing the next bounded implementation step.
-12. If autonomous project execution is enabled, the manager can continue through stored project steps until it reaches a real stop condition such as `ready_to_test`, approval-required, blocked/error, or the configured safety budget.
-13. After coding work, the manager may ask the reviewer agent to critique the latest implementation step using the coding summary and self-check.
-14. The manager stores compact project artifacts such as project plans, project state, research notes, review notes, project briefs, coding status, dependency status, and implementation reviews.
-15. The result is one of:
+12. Before a bounded coding step, the manager may ask the explorer agent for a repo overview, relevant paths, validation paths, suggested definition of done, and before-step file snapshots.
+13. The manager turns consultation plus explorer output into a manager-owned `coding_step_contract`.
+14. If autonomous project execution is enabled, the manager can continue through stored project steps until it reaches a real stop condition such as `ready_to_test`, approval-required, blocked/error, or the configured safety budget.
+15. After coding work, the manager may ask the reviewer agent to critique the latest implementation step using the coding summary, manager-owned step contract, before/after snapshots, and validation state.
+16. The manager stores compact project artifacts such as project plans, project state, manager constraints, research notes, review notes, project briefs, coding status, coding step contracts, coding context snapshots, coding change snapshots, dependency status, and implementation reviews.
+17. The result is one of:
    - direct manager reply
    - project plan
    - coding delegation
+   - explorer delegation
    - research delegation
    - review delegation
-16. If the route is `research`, the research agent may use configured web search and page previews when the task depends on current or external information.
-17. If the route is `coding`, the manager may provide a structured `CodingDelegationPlan`.
-18. The coding agent prefers that structured plan.
-19. If no structured coding plan is provided, the coding agent requests a structured action batch from its own model.
-20. The coding agent executes actions through the server-side tool layer.
-21. After a coding step, the manager can run a dependency audit and prepare an approval request for missing package installation inside the workspace virtualenv.
-22. If execution is requested, the coding agent prepares an approval request instead of running Python directly.
-23. The manager stores approval requests and sends a push notification.
-24. The pending assistant message is updated in place with the final manager reply or an explicit error.
-25. The frontend polls the active thread while a Thinking message exists and stops polling when processing is finished.
-26. Only the latest still-open processing message is rendered as an active Thinking block in the UI.
-27. The user approves or rejects execution or dependency-install requests in the web app.
-28. If approved, the backend validates the command again and runs Python through `bubblewrap` when possible.
-29. Successful and failed results are logged.
+18. If the route is `research`, the research agent may use configured web search and page previews when the task depends on current or external information.
+19. If the route is `coding`, the manager may provide a structured `CodingDelegationPlan`.
+20. The coding agent prefers that structured plan.
+21. If no structured coding plan is provided, the coding agent requests a structured action batch from its own model.
+22. The coding agent executes actions through the server-side tool layer.
+23. After a coding step, the manager derives validation state, can run a dependency audit, and can prepare approval requests for execution or missing package installation inside the workspace virtualenv.
+24. Stored manager constraints can block installs, pytest, validation execution, or automatic continuation after a step.
+25. The manager stores approval requests and sends a push notification.
+26. The pending assistant message is updated in place with the final manager reply or an explicit error.
+27. The frontend polls the active thread while a Thinking message exists and stops polling when processing is finished.
+28. Only the latest still-open processing message is rendered as an active Thinking block in the UI.
+29. The user approves or rejects execution or dependency-install requests in the web app.
+30. If approved, the backend validates the command again and runs Python through `bubblewrap` when possible.
+31. Successful and failed results are logged.
 
 ### Project planning flow
 
@@ -334,7 +383,8 @@ For collaborative multi-turn project work, the manager can now run a dedicated p
 3. ask the reviewer agent to challenge scope, missing validation, and places where user confirmation should be requested
 4. synthesize both results into a manager-owned proposal
 5. store that proposal as `project_plan` and `project_state`
-6. come back to the user with a concrete recommendation and explicit feedback points
+6. persist any explicit user prohibitions and confirmed implementation decisions as `manager_constraints`
+7. come back to the user with a concrete recommendation and explicit feedback points
 
 This makes the manager more suitable for long-running collaborative project delivery instead of one-shot coding only.
 
@@ -346,10 +396,12 @@ For coding requests that look too large for a one-shot implementation, the manag
 
 1. ask the research agent to break the request into smaller work packages, assumptions, and risks
 2. ask the reviewer agent to critique that decomposition and challenge oversized scope
-3. compress both results into thread-scoped artifacts
-4. pass the smallest safe next implementation step to the coding agent
-5. let the coding agent produce a self-check summary after execution
-6. let the reviewer agent critique the latest coding step when the step is substantive enough to justify the extra loop
+3. optionally ask the explorer agent to map the most relevant existing files, validation paths, repo shape, and before-step snapshots
+4. compress the internal results into thread-scoped artifacts and a manager-owned step contract
+5. pass the smallest safe next implementation step to the coding agent
+6. let the coding agent produce a self-check summary after execution
+7. let the reviewer agent critique the latest coding step when the step is substantive enough to justify the extra loop
+8. if the reviewer returns `needs_repair`, narrow the next step around the failed definition-of-done items instead of silently widening scope
 
 This keeps the external UX manager-centric while allowing more natural internal multi-step coordination.
 
@@ -376,8 +428,9 @@ When source metadata exists, the workflow additionally stores a dedicated `web_r
 -> `ManagerWorkflow`
 -> `ManagerPlanner (Ollama)`
 -> `LLM plan / explicit error response`
+-> `Optional Explorer`
 -> `DelegationService`
--> `CodingAgent / ResearchAgent / ReviewerAgent`
+-> `CodingAgent / ExplorerAgent / ResearchAgent / ReviewerAgent`
 -> `Workspace tools / approval system`
 -> `pending message updated in place`
 -> `frontend polling refresh`
@@ -470,6 +523,7 @@ If Ollama is unavailable, misconfigured, or returns unusable output:
 ### Top level
 
 - [README.md](README.md): project overview and onboarding
+- [docs/architecture_rootcause_todo_prompt.md](docs/architecture_rootcause_todo_prompt.md): ready-to-paste root-cause and TODO briefing for a follow-up Codex hardening chat
 - [requirements.txt](requirements.txt): runtime Python dependencies
 - [requirements-dev.txt](requirements-dev.txt): development dependencies
 - [pyproject.toml](pyproject.toml): test path + formatting/lint settings
@@ -486,6 +540,7 @@ If Ollama is unavailable, misconfigured, or returns unusable output:
 
 - [agents/manager.py](src/ai_hub/agents/manager.py): simple manager entrypoint wrapper
 - [agents/coding_agent.py](src/ai_hub/agents/coding_agent.py): LLM-backed structured coding action planning and execution
+- [agents/explorer_agent.py](src/ai_hub/agents/explorer_agent.py): LLM-backed read-only repo/context explorer worker
 - [agents/research_agent.py](src/ai_hub/agents/research_agent.py): LLM-backed read-only research worker
 - [agents/reviewer_agent.py](src/ai_hub/agents/reviewer_agent.py): LLM-backed read-only reviewer worker
 
@@ -531,6 +586,7 @@ If Ollama is unavailable, misconfigured, or returns unusable output:
 
 - [prompts/manager.txt](src/ai_hub/prompts/manager.txt)
 - [prompts/coding_agent.txt](src/ai_hub/prompts/coding_agent.txt)
+- [prompts/explorer_agent.txt](src/ai_hub/prompts/explorer_agent.txt)
 - [prompts/research_agent.txt](src/ai_hub/prompts/research_agent.txt)
 - [prompts/reviewer_agent.txt](src/ai_hub/prompts/reviewer_agent.txt)
 
